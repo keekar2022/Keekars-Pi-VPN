@@ -1,0 +1,48 @@
+<!-- Concept: Mukesh Kesharwani -->
+<!-- Contact: mukesh.kesharwani@adobe.com -->
+{% extends "base.html" %}
+{% block content %}
+<h1>System monitor</h1>
+
+<div id="rollback-banner" class="alert-banner hidden">
+  <span id="rollback-banner-text"></span>
+  <button id="rollback-banner-dismiss" type="button">Dismiss</button>
+</div>
+
+<div class="stat-row">
+  <div class="stat-tile"><span id="cpu-value">--</span>%<div class="stat-label">CPU</div></div>
+  <div class="stat-tile"><span id="mem-value">--</span>%<div class="stat-label">Memory</div></div>
+  <div class="stat-tile"><span id="disk-value">--</span>%<div class="stat-label">Disk</div></div>
+  <div class="stat-tile"><span id="downtime-value">--</span><div class="stat-label">Last downtime</div></div>
+</div>
+
+<canvas id="cpuChart" height="80"></canvas>
+
+<h2>Network throughput</h2>
+<table id="iface-table">
+  <thead><tr><th>Interface</th><th>Transmit</th><th>Receive</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<div class="proc-tables">
+  <div>
+    <h2>Top processes by CPU</h2>
+    <table id="top-cpu-table">
+      <thead><tr><th>PID</th><th>Name</th><th>CPU %</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div>
+    <h2>Top processes by memory</h2>
+    <table id="top-mem-table">
+      <thead><tr><th>PID</th><th>Name</th><th>Memory</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<p id="monitor-status"></p>
+
+<script src="/static/vendor/chart.umd.min.js"></script>
+<script src="/static/dashboard.js"></script>
+{% endblock %}

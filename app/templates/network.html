@@ -1,0 +1,47 @@
+<!-- Concept: Mukesh Kesharwani -->
+<!-- Contact: mukesh.kesharwani@adobe.com -->
+{% extends "base.html" %}
+{% block content %}
+<h1>Network</h1>
+
+<table id="iface-table">
+  <thead><tr><th>Interface</th><th>Up</th><th>Addresses</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>Configure interface</h2>
+<form id="config-form">
+  <label>Interface <select name="interface" id="config-iface-select" required></select></label>
+  <label>Method
+    <select name="method">
+      <option value="dhcp">DHCP</option>
+      <option value="static">Static</option>
+    </select>
+  </label>
+  <label>Address (CIDR, static only) <input name="address" placeholder="192.168.1.50/24"></label>
+  <label>Gateway (static only) <input name="gateway" placeholder="192.168.1.1"></label>
+  <button type="submit">Apply</button>
+</form>
+
+<h2>Wi-Fi</h2>
+<form id="wifi-form">
+  <label>Network
+    <select id="wifi-network-select">
+      <option value="__new__">-- New network --</option>
+    </select>
+  </label>
+  <div id="new-wifi-wrap">
+    <label>SSID <input name="ssid" id="wifi-ssid-input" placeholder="Enter SSID, or scan below"></label>
+    <button type="button" id="scan-wifi-btn">Scan for networks</button>
+    <ul id="scan-results"></ul>
+  </div>
+  <label>Password <span class="hint" id="psk-hint"></span>
+    <input name="psk" type="password" minlength="8">
+  </label>
+  <button type="submit">Connect</button>
+</form>
+
+<p id="network-status"></p>
+
+<script src="/static/network.js"></script>
+{% endblock %}

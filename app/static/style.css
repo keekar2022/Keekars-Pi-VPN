@@ -1,0 +1,43 @@
+/* Concept: Mukesh Kesharwani */
+/* Contact: mukesh.kesharwani@adobe.com */
+
+body { font-family: system-ui, sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }
+nav { display: flex; align-items: center; gap: 1rem; padding: 0.75rem 1.5rem; background: #0f172a; }
+nav .brand { color: #fff; font-weight: 600; margin-right: 0.5rem; }
+nav a { color: #e2e8f0; text-decoration: none; }
+nav a:hover { color: #fff; }
+nav .spacer { flex: 1; }
+nav .user { color: #94a3b8; font-size: 0.875rem; }
+main { max-width: 720px; margin: 0 auto; padding: 1.5rem; }
+footer { max-width: 720px; margin: 2rem auto 1rem; padding: 0 1.5rem; font-size: 0.75rem; color: #94a3b8; text-align: center; }
+h1, h2 { font-weight: 600; }
+form { display: flex; flex-direction: column; gap: 0.5rem; max-width: 360px; margin-bottom: 1.5rem; }
+label { display: flex; flex-direction: column; font-size: 0.875rem; gap: 0.25rem; }
+label.checkbox-label { flex-direction: row; align-items: center; gap: 0.5rem; }
+.hidden { display: none; }
+input, select { padding: 0.4rem; border: 1px solid #cbd5e1; border-radius: 4px; }
+button { padding: 0.5rem 1rem; border: none; border-radius: 4px; background: #2563eb; color: #fff; cursor: pointer; }
+button:hover { background: #1d4ed8; }
+table { width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; }
+th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #e2e8f0; }
+.stat-row { display: flex; gap: 1rem; margin-bottom: 1rem; }
+.stat-tile { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 1rem 1.5rem; font-size: 1.5rem; }
+.stat-label { font-size: 0.75rem; color: #64748b; }
+.proc-tables { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+.proc-tables > div { flex: 1 1 300px; }
+#network-status.ok, #routing-status.ok, #tunnel-status.ok, #peer-status.ok { color: #16a34a; }
+#network-status.error, #routing-status.error, #monitor-status.error, #tunnel-status.error, #peer-status.error { color: #dc2626; }
+span.ok { color: #16a34a; font-weight: 600; }
+span.error { color: #dc2626; font-weight: 600; }
+.hint { font-size: 0.8rem; color: #64748b; max-width: 360px; }
+#scan-results { list-style: none; padding: 0; margin: 0.5rem 0; display: flex; flex-direction: column; gap: 0.25rem; }
+#scan-results button { background: #fff; color: #0f172a; border: 1px solid #cbd5e1; text-align: left; font-size: 0.8rem; padding: 0.35rem 0.6rem; }
+#scan-results button:hover { background: #f1f5f9; }
+#new-wifi-wrap { display: flex; flex-direction: column; gap: 0.5rem; }
+.alert-banner:not(.hidden) { display: flex; align-items: center; justify-content: space-between; gap: 1rem; background: #fee2e2; border: 2px solid #dc2626; border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; color: #991b1b; font-weight: 600; animation: alert-pulse 2s ease-in-out infinite; }
+.alert-banner button { background: #dc2626; }
+.alert-banner button:hover { background: #b91c1c; }
+@keyframes alert-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.4); }
+  50% { box-shadow: 0 0 0 8px rgba(220, 38, 38, 0); }
+}

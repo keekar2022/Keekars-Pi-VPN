@@ -1,0 +1,56 @@
+# Concept: Mukesh Kesharwani
+# Contact: mukesh.kesharwani@adobe.com
+#
+# Install: sudo cp deploy/pi-config-ui.service /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable --now pi-config-ui
+#
+# WireGuard feature (app/wireguard.py) needs one addition beyond the base
+# install: /etc/pi-config-ui/wireguard must exist and be owned by this
+# user for the ReadWritePaths grant below to work (group membership for
+# the helper's socket is granted via SupplementaryGroups= below, no
+# usermod needed):
+#   sudo mkdir -p /etc/pi-config-ui/wireguard
+#   sudo chown pi-config-ui:pi-config-ui /etc/pi-config-ui/wireguard
+#
+# Downtime-tracking feature (app/monitor.py) needs the same treatment for
+# its own state dir:
+#   sudo mkdir -p /etc/pi-config-ui/monitor
+#   sudo chown pi-config-ui:pi-config-ui /etc/pi-config-ui/monitor
+
+[Unit]
+Description=Pi Config UI
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi-config-ui
+Group=pi-config-ui
+WorkingDirectory=/opt/pi-config-ui
+EnvironmentFile=/etc/pi-config-ui/sso.env
+ExecStart=/opt/pi-config-ui/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 443 --ssl-keyfile /etc/pi-config-ui/tls/key.pem --ssl-certfile /etc/pi-config-ui/tls/cert.pem
+Restart=on-failure
+RestartSec=5
+
+# Least-privilege: no sudo/root. CAP_NET_ADMIN is granted narrowly so
+# pyroute2 can manage the routing table (RTNETLINK) without running as
+# root. CAP_NET_BIND_SERVICE is granted narrowly so uvicorn can bind port
+# 443 directly (avoiding a reverse proxy) without running as root.
+# NetworkManager/nmcli actions are authorized separately via the polkit
+# rule in deploy/polkit-rules/. WireGuard's actually-privileged operations
+# (writing /etc/wireguard/*.conf, wg-quick, systemctl) are brokered by the
+# separate pi-wg-helperd.service over a Unix socket instead of being
+# granted here — this unit's sandboxing is unchanged by that feature; only
+# the peer-metadata JSON (no secrets) needs a path.
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+SupplementaryGroups=pi-wg-helper
+ReadWritePaths=/etc/NetworkManager/system-connections /etc/pi-config-ui/wireguard /etc/pi-config-ui/monitor
+
+[Install]
+WantedBy=multi-user.target

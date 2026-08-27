@@ -1,0 +1,23 @@
+<!-- Concept: Mukesh Kesharwani -->
+<!-- Contact: mukesh.kesharwani@adobe.com -->
+{% extends "base.html" %}
+{% block content %}
+<h1>Routing</h1>
+
+<table id="route-table">
+  <thead><tr><th>Destination</th><th>Gateway</th><th>Interface</th><th></th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>Add route</h2>
+<form id="route-form">
+  <label>Destination (CIDR) <input name="destination" placeholder="10.0.0.0/24" required></label>
+  <label>Gateway <input name="gateway" placeholder="192.168.1.1"></label>
+  <label>Interface <input name="interface" required></label>
+  <button type="submit">Add</button>
+</form>
+
+<p id="routing-status"></p>
+
+<script src="/static/routing.js"></script>
+{% endblock %}

@@ -1,0 +1,7 @@
+# Concept: Mukesh Kesharwani
+# Contact: mukesh.kesharwani@adobe.com
+#
+# Dev/CI-only — never install this on the Pi itself. Layer on top of
+# requirements.txt: pip install -r requirements.txt -r requirements-dev.txt
+
+pytest==8.3.3

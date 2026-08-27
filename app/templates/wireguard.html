@@ -1,0 +1,54 @@
+<!-- Concept: Mukesh Kesharwani -->
+<!-- Contact: mukesh.kesharwani@adobe.com -->
+{% extends "base.html" %}
+{% block content %}
+<h1>WireGuard</h1>
+
+<h2>Client connections</h2>
+<table id="client-table">
+  <thead><tr><th>Name</th><th>Status</th><th>Remote endpoint</th><th>Last handshake</th><th></th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>Server tunnels</h2>
+<table id="tunnel-table">
+  <thead><tr><th>Name</th><th>State</th><th>Address</th><th>Port</th><th>Peers</th><th></th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>Create tunnel</h2>
+<form id="tunnel-form">
+  <label>Name <input name="name" placeholder="wg0" required></label>
+  <label>Address (CIDR) <input name="address" placeholder="10.7.0.1/24" required></label>
+  <label>Listen port <input name="listen_port" type="number" min="1024" max="65535" value="51820" required></label>
+  <label>Endpoint (hostname/IP clients dial) <input name="endpoint" placeholder="vpn.example.com"></label>
+  <label id="tunnel-force-wrap" class="checkbox-label hidden">
+    <input type="checkbox" id="tunnel-force"> This tunnel's address deliberately overlaps a local network — create anyway
+  </label>
+  <button type="submit">Create</button>
+</form>
+
+<p id="tunnel-status"></p>
+
+<h2>Peers</h2>
+<label>Tunnel <select id="peer-tunnel-select"><option value="">-- select a tunnel --</option></select></label>
+
+<table id="peer-table">
+  <thead><tr><th>Description</th><th>Address</th><th>Allowed IPs</th><th>Last handshake</th><th></th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<h3>Add peer</h3>
+<form id="peer-form">
+  <label>Description <input name="description" placeholder="phone" required></label>
+  <label>Allowed IPs (comma-separated) <input name="allowed_ips" placeholder="0.0.0.0/0" required></label>
+  <label class="checkbox-label"><input type="checkbox" name="preshared_key"> Generate preshared key</label>
+  <label>Keepalive (s) <input name="keepalive" type="number" min="0" max="3600" value="25"></label>
+  <button type="submit">Add &amp; download config</button>
+</form>
+<p class="hint">The generated .conf can only be downloaded once — save it now. If it's lost, delete this peer and add a new one.</p>
+
+<p id="peer-status"></p>
+
+<script src="/static/wireguard.js"></script>
+{% endblock %}

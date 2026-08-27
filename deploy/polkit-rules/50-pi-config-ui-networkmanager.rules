@@ -1,0 +1,22 @@
+// Concept: Mukesh Kesharwani
+// Contact: mukesh.kesharwani@adobe.com
+//
+// Grants the unprivileged pi-config-ui service user only the specific
+// NetworkManager actions it needs (modify/activate connections) instead of
+// a blanket allow — install to /etc/polkit-1/rules.d/.
+// Verify the exact action IDs against `pkaction` on the target NM version;
+// the set below covers modifying system connection profiles and
+// bringing interfaces up/down, which is what app/network.py exercises.
+
+polkit.addRule(function (action, subject) {
+  const allowedActions = [
+    "org.freedesktop.NetworkManager.settings.modify.system",
+    "org.freedesktop.NetworkManager.network-control",
+    "org.freedesktop.NetworkManager.enable-disable-wifi",
+  ];
+
+  if (allowedActions.indexOf(action.id) !== -1 && subject.user === "pi-config-ui") {
+    return polkit.Result.YES;
+  }
+  return polkit.Result.NOT_HANDLED;
+});

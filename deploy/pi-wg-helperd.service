@@ -1,0 +1,53 @@
+# Concept: Mukesh Kesharwani
+# Contact: mukesh.kesharwani@adobe.com
+#
+# Small always-root helper brokering privileged WireGuard operations
+# (writing /etc/wireguard/*.conf, running wg/wg-quick/systemctl) for the
+# unprivileged pi-config-ui service, over a Unix socket — see
+# deploy/pi-wg-helperd/helper.py for the protocol and rationale. This is
+# the WireGuard-specific equivalent of the NetworkManager+polkit brokering
+# already in place for nmcli (deploy/polkit-rules/); WireGuard has no
+# D-Bus/polkit surface of its own to reuse, so this fills that gap with
+# the smallest amount of new privileged surface reasonably possible.
+#
+# Install:
+#   sudo groupadd --system pi-wg-helper
+#   # (pi-config-ui.service grants itself membership via SupplementaryGroups=,
+#   # no usermod needed — just make sure this group exists first)
+#   sudo mkdir -p /opt/pi-wg-helperd
+#   sudo cp deploy/pi-wg-helperd/helper.py /opt/pi-wg-helperd/
+#   sudo cp deploy/pi-wg-helperd.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pi-wg-helperd
+
+[Unit]
+Description=Pi Config UI - WireGuard privileged helper
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+# The directory itself is created root:root (this service's User=/Group=)
+# regardless of the socket file's own group ownership below — 0750 would
+# deny pi-config-ui even directory-traversal (search) permission to reach
+# the socket, since it's not in the "root" group. 0755 only grants path
+# traversal; the socket file's own 0660 root:pi-wg-helper mode (set in
+# helper.py's main()) is what actually gates read/write access to it.
+RuntimeDirectory=pi-wg-helperd
+RuntimeDirectoryMode=0755
+ExecStart=/usr/bin/python3 /opt/pi-wg-helperd/helper.py
+Restart=on-failure
+RestartSec=5
+
+# This process must run as root to write root:root 600 files under
+# /etc/wireguard and to enable/start wg-quick@* units — that's the whole
+# reason it's split out from pi-config-ui.service, which stays unprivileged.
+# NoNewPrivileges is still set: this daemon never needs to escalate beyond
+# what it starts with as root, so the same defense-in-depth applies.
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

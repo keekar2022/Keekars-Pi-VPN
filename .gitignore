@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+sso.env
+*.nmconnection
+.DS_Store
+.pytest_cache/
+.claude/
+mcp-server.log
+private.key

@@ -1,0 +1,36 @@
+# Concept: Mukesh Kesharwani
+# Contact: mukesh.kesharwani@adobe.com
+#
+# Runs once per boot: waits for pi-config-ui to become healthy, and if it
+# doesn't, attempts a restart and then a best-effort package rollback (only
+# for packages whose pre-upgrade .deb was preserved by cmd_os_update's
+# snapshot step — see deploy/maintenance.sh's cmd_boot_check and
+# docs/RUNBOOK.md for what this does and does not cover). Must run as root
+# (unlike the sandboxed pi-config-ui.service) since a rollback needs
+# apt-get install.
+#
+# Install: sudo cp deploy/pi-config-ui-boot-check.service /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable pi-config-ui-boot-check
+# (enable, not enable --now — this is meant to run once per boot via
+# WantedBy=multi-user.target, not started immediately on install; run it
+# manually with `systemctl start pi-config-ui-boot-check` to test it now.)
+
+[Unit]
+Description=Pi Config UI - post-boot health check and rollback failsafe
+After=pi-config-ui.service
+Wants=pi-config-ui.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+# Generous but bounded: the script's own internal health-poll loop (~3 min)
+# plus a possible apt-get install rollback and reboot decision shouldn't
+# ever need this long, but a hard ceiling here means a bug in the script
+# can't hang boot-check indefinitely.
+TimeoutStartSec=600
+ExecStart=/opt/pi-config-ui/maintenance.sh boot-check
+
+[Install]
+WantedBy=multi-user.target
