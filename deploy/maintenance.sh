@@ -5,7 +5,7 @@
 # Scheduled maintenance for this Pi, installed by deploy/deploy.sh into
 # /etc/cron.d/pi-config-ui-maintenance. Runs as root (cron.d specifies the
 # user directly). Manual invocation:
-#   sudo /opt/pi-config-ui/maintenance.sh {health|cert-renew|cleanup|os-update|ddns-update|reboot|boot-check}
+#   sudo /opt/pi-config-ui/maintenance.sh {health|cert-renew|cleanup|os-update|ddns-update|reboot|boot-check|wifi-recovery-check|wifi-recovery-console}
 #
 # SAFETY: must never touch a WireGuard CLIENT-role tunnel (e.g. Syd-Home)
 # — see docs/PROJECT_NOTES.md Part 3 for why (a client tunnel with
@@ -448,6 +448,236 @@ cmd_boot_check() {
   log "ERROR: boot-check: pi-config-ui still unhealthy and no further automatic action will be taken — manual intervention required"
 }
 
+# --- Wi-Fi recovery: gate --------------------------------------------------
+#
+# HDMI+keyboard fallback for when this Pi has no working network at all (so
+# the web GUI is unreachable too) — see docs/RUNBOOK.md §1b. Triggered by
+# wifi-recovery-check.service (boot) and 99-wifi-recovery.rules (HDMI
+# hotplug, via `systemctl start --no-block`). Safe to invoke unconditionally
+# and repeatedly — a no-op unless a monitor is attached AND there's no
+# working network.
+
+_WIFI_HDMI_STATUS_GLOB="/sys/class/drm/card*-HDMI-A-1/status"
+
+wifi_hdmi_connected() {
+  local f
+  for f in $_WIFI_HDMI_STATUS_GLOB; do
+    [ -f "$f" ] || continue
+    if [ "$(cat "$f" 2>/dev/null)" = "connected" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+wifi_network_connected() {
+  local state
+  state=$(nmcli networking connectivity check 2>/dev/null) || true
+  [ "$state" = "full" ] || [ "$state" = "limited" ]
+}
+
+cmd_wifi_recovery_check() {
+  if ! wifi_hdmi_connected; then
+    log "wifi-recovery-check: no HDMI monitor attached — nothing to do"
+    return 0
+  fi
+
+  if wifi_network_connected; then
+    log "wifi-recovery-check: HDMI attached but already connected — nothing to do"
+    return 0
+  fi
+
+  log "wifi-recovery-check: HDMI attached and no working network — launching recovery console on tty1"
+
+  # getty@tty1 would otherwise also be reading/writing tty1 concurrently,
+  # producing garbled interleaved output with whiptail. `systemctl stop`
+  # blocks until getty@tty1 has actually exited, so by the time the
+  # `systemctl start` below runs, tty1 is guaranteed free — this ordering
+  # (stop fully, THEN start the console unit) avoids a race where the
+  # console unit's own TTYPath session setup could otherwise briefly
+  # overlap with getty still holding the same tty as its controlling
+  # terminal (see wifi-recovery-console.service). Always restore getty
+  # afterward, even on error/interruption — leaving the Pi without a login
+  # prompt on tty1 would be worse than the problem this exists to fix.
+  systemctl stop getty@tty1.service || true
+  trap 'systemctl start getty@tty1.service || true' EXIT
+
+  # A separate unit owns TTYPath=/dev/tty1 — `systemctl start` blocks until
+  # that oneshot unit's ExecStart (cmd_wifi_recovery_console, below) fully
+  # exits, with systemd (not this function) responsible for the TTY
+  # session/ncurses-input setup whiptail needs.
+  systemctl start wifi-recovery-console.service || true
+
+  log "wifi-recovery-check: recovery console exited"
+}
+
+# --- Wi-Fi recovery: interactive console ------------------------------------
+#
+# Runs on the physical HDMI console only (invoked by
+# wifi-recovery-console.service, never over SSH/network — the whole point
+# is to work when there is no network). Uses exactly the same nmcli verbs
+# as app/network.py's GUI Wi-Fi feature (device wifi list, device wifi
+# connect <ssid> password <psk>, connection show) — both are just clients
+# of NetworkManager's own /etc/NetworkManager/system-connections profile
+# store, so a network added here shows up in the GUI's known-networks list
+# and vice versa, with no sync logic needed.
+#
+# Field-splitting below is a naive split on colons — the same tradeoff
+# app/network.py's _parse_nmcli_terse acknowledges (an SSID containing a
+# literal colon would need its escape-aware regex instead). Fine for an
+# interactively-operated recovery console.
+#
+# Unlike every other cmd_* here, this runs interactively — nmcli/whiptail
+# non-zero exits (Cancel/Escape, a failed connect attempt) are normal
+# control flow, not fatal script errors. Every one is explicitly guarded
+# (`|| true`) below: under maintenance.sh's own `set -euo pipefail`, an
+# unguarded failing command aborts the ENTIRE script immediately at that
+# line — before even reaching a `return` on the next line — so e.g.
+# pressing Escape on a plain informational msgbox would otherwise kill the
+# whole recovery console instead of just dismissing the dialog.
+
+_WIFI_TITLE="Keekar's Pi VPN — Wi-Fi Recovery"
+
+wifi_scan_networks() {
+  nmcli -t -f SSID,SIGNAL,SECURITY device wifi list --rescan yes 2>/dev/null
+}
+
+wifi_known_networks() {
+  nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2 == "802-11-wireless" || $2 == "wifi" { print $1 }'
+}
+
+wifi_current_status() {
+  local dev_line ssid ip
+  dev_line=$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null | awk -F: '$2 == "wifi" { print }' | head -1) || true
+  ssid=$(echo "$dev_line" | cut -d: -f4)
+  ip=$(nmcli -t -f IP4.ADDRESS device show "$(echo "$dev_line" | cut -d: -f1)" 2>/dev/null | head -1 | cut -d: -f2) || true
+  if [ -n "$ssid" ] && [ "$ssid" != "--" ]; then
+    printf 'Connected to: %s\nIP address: %s\n' "$ssid" "${ip:-none yet}"
+  else
+    echo "Not connected to any Wi-Fi network."
+  fi
+}
+
+wifi_menu_scan_and_connect() {
+  local raw menu_items=() ssid signal security count=0
+  raw=$(wifi_scan_networks) || true
+  if [ -z "$raw" ]; then
+    whiptail --title "$_WIFI_TITLE" --msgbox "No networks found in range. Try again, or check the Pi is near the router." 10 60 || true
+    return 0
+  fi
+  # Dedup by SSID, keep the strongest signal seen (same intent as
+  # app/network.py's scan_wifi, simplified for a bash menu).
+  declare -A best_signal best_security
+  while IFS=: read -r ssid signal security; do
+    [ -z "$ssid" ] && continue
+    local prev="${best_signal[$ssid]:-}"
+    if [ -z "$prev" ] || [ "${signal:-0}" -gt "$prev" ]; then
+      best_signal["$ssid"]="${signal:-0}"
+      best_security["$ssid"]="${security:-open}"
+    fi
+  done <<< "$raw"
+
+  for ssid in "${!best_signal[@]}"; do
+    menu_items+=("$ssid" "signal ${best_signal[$ssid]}% • ${best_security[$ssid]}")
+    count=$((count + 1))
+  done
+  if [ "$count" -eq 0 ]; then
+    whiptail --title "$_WIFI_TITLE" --msgbox "No networks found in range." 10 60 || true
+    return 0
+  fi
+
+  local chosen
+  chosen=$(whiptail --title "$_WIFI_TITLE" --menu "Select a network to connect to:" 20 70 10 "${menu_items[@]}" 3>&1 1>&2 2>&3) || return 0
+  wifi_connect_with_password "$chosen" || true
+}
+
+wifi_menu_known_networks() {
+  local names menu_items=() name count=0
+  names=$(wifi_known_networks) || true
+  if [ -z "$names" ]; then
+    whiptail --title "$_WIFI_TITLE" --msgbox "No previously-saved Wi-Fi networks found." 10 60 || true
+    return 0
+  fi
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    menu_items+=("$name" "")
+    count=$((count + 1))
+  done <<< "$names"
+  if [ "$count" -eq 0 ]; then
+    whiptail --title "$_WIFI_TITLE" --msgbox "No previously-saved Wi-Fi networks found." 10 60 || true
+    return 0
+  fi
+
+  local chosen
+  chosen=$(whiptail --title "$_WIFI_TITLE" --menu "Reconnect to a known network:" 20 70 10 "${menu_items[@]}" 3>&1 1>&2 2>&3) || return 0
+  if nmcli connection up "$chosen" >/tmp/wifi-recovery-result 2>&1; then
+    whiptail --title "$_WIFI_TITLE" --msgbox "Connected to $chosen." 10 60 || true
+  else
+    whiptail --title "$_WIFI_TITLE" --msgbox "Failed to connect:"$'\n'"$(cat /tmp/wifi-recovery-result)" 15 70 || true
+  fi
+}
+
+wifi_menu_manual_entry() {
+  local ssid
+  ssid=$(whiptail --title "$_WIFI_TITLE" --inputbox "Enter the network name (SSID):" 10 60 3>&1 1>&2 2>&3) || return 0
+  [ -z "$ssid" ] && return 0
+  wifi_connect_with_password "$ssid" || true
+}
+
+wifi_connect_with_password() {
+  local ssid="$1" psk=""
+  if whiptail --title "$_WIFI_TITLE" --yesno "Does '$ssid' require a password?" 10 60; then
+    psk=$(whiptail --title "$_WIFI_TITLE" --passwordbox "Enter the password for '$ssid':" 10 60 3>&1 1>&2 2>&3) || return 0
+  fi
+
+  whiptail --title "$_WIFI_TITLE" --infobox "Connecting to $ssid ..." 8 60 || true
+  local connect_ok=0
+  if [ -n "${psk:-}" ]; then
+    # Same command app/network.py's wifi_connect runs for a new SSID+PSK —
+    # this both saves the profile AND connects, identical to the GUI.
+    nmcli device wifi connect "$ssid" password "$psk" >/tmp/wifi-recovery-result 2>&1 || connect_ok=1
+  else
+    nmcli device wifi connect "$ssid" >/tmp/wifi-recovery-result 2>&1 || connect_ok=1
+  fi
+
+  if [ "$connect_ok" -eq 0 ]; then
+    whiptail --title "$_WIFI_TITLE" --msgbox "Connected to $ssid." 10 60 || true
+  else
+    whiptail --title "$_WIFI_TITLE" --msgbox "Failed to connect:"$'\n'"$(cat /tmp/wifi-recovery-result)" 15 70 || true
+  fi
+}
+
+wifi_main_menu() {
+  while true; do
+    local choice status
+    if choice=$(whiptail --title "$_WIFI_TITLE" --menu "$(wifi_current_status)"$'\n\nWhat would you like to do?' 20 70 6 \
+      "1" "Scan for networks and connect" \
+      "2" "Connect to a previously-saved network" \
+      "3" "Enter a network name manually (hidden SSID)" \
+      "4" "Refresh status" \
+      "5" "Exit to login prompt" \
+      3>&1 1>&2 2>&3); then
+      status=0
+    else
+      status=$?
+    fi
+    if [ "$status" -ne 0 ]; then
+      break
+    fi
+    case "$choice" in
+      1) wifi_menu_scan_and_connect ;;
+      2) wifi_menu_known_networks ;;
+      3) wifi_menu_manual_entry ;;
+      4) ;;
+      5) break ;;
+    esac
+  done
+}
+
+cmd_wifi_recovery_console() {
+  wifi_main_menu
+}
+
 case "${1:-}" in
   health) cmd_health ;;
   cert-renew) cmd_cert_renew ;;
@@ -456,5 +686,7 @@ case "${1:-}" in
   ddns-update) cmd_ddns_update ;;
   reboot) cmd_reboot ;;
   boot-check) cmd_boot_check ;;
-  *) echo "Usage: $0 {health|cert-renew|cleanup|os-update|ddns-update|reboot|boot-check}" >&2; exit 1 ;;
+  wifi-recovery-check) cmd_wifi_recovery_check ;;
+  wifi-recovery-console) cmd_wifi_recovery_console ;;
+  *) echo "Usage: $0 {health|cert-renew|cleanup|os-update|ddns-update|reboot|boot-check|wifi-recovery-check|wifi-recovery-console}" >&2; exit 1 ;;
 esac

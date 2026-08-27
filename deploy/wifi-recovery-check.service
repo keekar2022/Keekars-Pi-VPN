@@ -1,0 +1,45 @@
+# Concept: Mukesh Kesharwani
+# Contact: mukesh.kesharwani@adobe.com
+#
+# Physical-console Wi-Fi recovery — the GATE, not the console itself (see
+# wifi-recovery-console.service for that). Triggered at boot AND by
+# deploy/udev-rules/99-wifi-recovery.rules on every HDMI hotplug event.
+# The logic (maintenance.sh's cmd_wifi_recovery_check, consolidated there
+# alongside every other on-Pi script — see docs/RUNBOOK.md §1b) is the
+# actual gate — it's a no-op unless a monitor is attached AND there's no
+# working network, which is what makes it safe to invoke unconditionally
+# and repeatedly from both triggers. `systemctl start` on an already-running
+# oneshot is a no-op, so rapid plug/unplug/plug can't stack multiple
+# recovery consoles.
+#
+# Deliberately has NO TTYPath/Conflicts=getty@tty1 of its own: this unit
+# never touches tty1 directly, so it starting is never disruptive even
+# when (the overwhelmingly common case) it turns out to be a no-op.
+# maintenance.sh itself explicitly stops getty@tty1 and only then starts
+# wifi-recovery-console.service (which owns the TTY) — see that unit and
+# maintenance.sh's cmd_wifi_recovery_check for why the ordering is split
+# this way.
+#
+# Install: sudo cp deploy/wifi-recovery-check.service /etc/systemd/system/
+#          sudo cp deploy/wifi-recovery-console.service /etc/systemd/system/
+#          sudo cp deploy/udev-rules/99-wifi-recovery.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload-rules
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable wifi-recovery-check.service
+# (enable, not enable --now — boot/hotplug triggered, same pattern as
+# pi-config-ui-boot-check.service. wifi-recovery-console.service is never
+# enabled — only ever started explicitly by the check script.)
+
+[Unit]
+Description=Keekar's Pi VPN - physical console Wi-Fi recovery (gate)
+After=NetworkManager-wait-online.service
+Wants=NetworkManager-wait-online.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/pi-config-ui/maintenance.sh wifi-recovery-check
+
+[Install]
+WantedBy=multi-user.target

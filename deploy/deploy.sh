@@ -35,7 +35,8 @@
 # user must exist before its venv can be created):
 #   bootstrap_system -> provision_tls_cert -> deploy_code ->
 #   install_dependencies -> configure_sso -> install_units ->
-#   set_permissions -> setup_cron -> restart_services -> verify_deployment
+#   install_wifi_recovery -> set_permissions -> setup_cron ->
+#   restart_services -> verify_deployment
 #
 # --only runs a single function in isolation and assumes prior functions'
 # state already exists (e.g. --only setup_cron needs deploy_code to have
@@ -174,7 +175,12 @@ set -euo pipefail
 rsync -a --delete "$STAGE_DIR/app/" /opt/pi-config-ui/app/
 cp "$STAGE_DIR/requirements.txt" /opt/pi-config-ui/requirements.txt
 mkdir -p /opt/pi-config-ui/deploy
-rsync -a "$STAGE_DIR/deploy/" /opt/pi-config-ui/deploy/
+# --delete matters here: without it, a file removed from the repo (e.g.
+# an old script folded into another during a consolidation) silently
+# lingers on the Pi forever, executable and out of sync with what's
+# actually referenced by any systemd unit/cron entry — exactly the kind
+# of orphaned-file failure risk this project is trying to keep down.
+rsync -a --delete "$STAGE_DIR/deploy/" /opt/pi-config-ui/deploy/
 chown -R pi-config-ui:pi-config-ui /opt/pi-config-ui/app /opt/pi-config-ui/requirements.txt /opt/pi-config-ui/deploy
 rm -rf "$STAGE_DIR"
 REMOTE
@@ -267,6 +273,25 @@ chmod 755 /opt/pi-wg-helperd/helper.py
 cp /opt/pi-config-ui/deploy/polkit-rules/50-pi-config-ui-networkmanager.rules /etc/polkit-1/rules.d/
 systemctl daemon-reload
 systemctl enable pi-config-ui pi-wg-helperd pi-config-ui-boot-check
+REMOTE
+}
+
+# Physical-console Wi-Fi recovery: HDMI+keyboard fallback when the Pi has
+# no working network at all (so the web UI is unreachable too) — see
+# docs/RUNBOOK.md. Two scripts (already synced to /opt/pi-config-ui/deploy/
+# by deploy_code) + two units (a gate, and a separate TTY-owning console
+# unit only ever started explicitly by the gate — never both enabled) +
+# one udev rule for the hotplug trigger.
+install_wifi_recovery() {
+  log "Installing physical-console Wi-Fi recovery"
+  remote <<'REMOTE'
+set -euo pipefail
+cp /opt/pi-config-ui/deploy/wifi-recovery-check.service /etc/systemd/system/wifi-recovery-check.service
+cp /opt/pi-config-ui/deploy/wifi-recovery-console.service /etc/systemd/system/wifi-recovery-console.service
+cp /opt/pi-config-ui/deploy/udev-rules/99-wifi-recovery.rules /etc/udev/rules.d/99-wifi-recovery.rules
+udevadm control --reload-rules
+systemctl daemon-reload
+systemctl enable wifi-recovery-check.service
 REMOTE
 }
 
@@ -404,6 +429,7 @@ main() {
     install_dependencies
     configure_sso
     install_units
+    install_wifi_recovery
     set_permissions
     setup_cron
     restart_services

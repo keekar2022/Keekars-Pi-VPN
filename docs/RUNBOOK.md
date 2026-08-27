@@ -117,6 +117,114 @@ A single flaky Wi-Fi reconnect can also *transiently* produce an empty
 `resolv.conf` even when the underlying config is correct — don't chase a
 fix from one snapshot; re-check once the link has been stable a minute.
 
+## 1b. Physical-console Wi-Fi recovery (HDMI + keyboard fallback)
+
+If this Pi ever loses Wi-Fi entirely (moved location, SSID/password
+changed), the web GUI becomes unreachable too — it's only served over the
+network the Pi itself needs to be on. `deploy/maintenance.sh`'s
+`wifi-recovery-console` subcommand is a `whiptail`-based console tool for
+exactly that case, launched automatically — no SSH/network needed to
+reach it. Consolidated into `maintenance.sh` (alongside every other
+on-Pi script — one file to lint/test/maintain instead of several) rather
+than living in its own standalone script; the two systemd units below
+still exist separately, since they represent different privilege/TTY
+lifecycles, not just different code.
+
+**Uses the same `nmcli` commands `app/network.py`'s GUI Wi-Fi feature
+does** (`device wifi list`, `device wifi connect <ssid> password <psk>`,
+`connection show`) against the same
+`/etc/NetworkManager/system-connections/` profile store — a network added
+via either one is immediately visible/usable in the other, no sync logic
+needed. They also can never run at the same time in practice: the console
+only ever launches when there's no working connection, which is exactly
+when the GUI is unreachable. Multiple saved networks failing over to
+whichever is actually in range is inherent NetworkManager `autoconnect`
+behavior once more than one profile exists — not something this tool
+implements, just something adding more profiles benefits from for free.
+
+**Two triggers, one idempotent gate** (`maintenance.sh`'s
+`wifi-recovery-check` subcommand, run by `wifi-recovery-check.service`):
+checks
+`/sys/class/drm/card*-HDMI-A-1/status` for `connected` (confirmed on the
+real device to use the modern KMS graphics stack, not the legacy
+`tvservice`) and `nmcli networking connectivity check` (must run as
+root — an unprivileged user gets "Not authorized"); if either isn't met,
+it's a no-op. This same idempotent check runs both at boot
+(`WantedBy=multi-user.target`, `After=NetworkManager-wait-online.service`
+— covers a monitor already attached when it can't connect) and on every
+HDMI hotplug event (`deploy/udev-rules/99-wifi-recovery.rules`, matching
+any DRM `change` event and letting the gate's own status check determine
+whether it actually means HDMI — covers plugging a monitor in later while
+already stuck headless). Since it's a real systemd service,
+`systemctl start` on an already-running instance is a safe no-op — rapid
+plug/unplug/plug can't stack multiple recovery consoles.
+
+**Two systemd units, deliberately split** (`wifi-recovery-check.service`
++ `wifi-recovery-console.service`), not one: the console needs
+`TTYPath=/dev/tty1` (the same mechanism `getty@.service` itself uses —
+whiptail's ncurses UI needs a real controlling-terminal session for
+keyboard input, not just file-descriptor redirection to `/dev/tty1`) to
+take over the physical console, but `getty@tty1.service` must be fully,
+synchronously stopped *first* or the two fight over the same tty. Putting
+both concerns in one unit risks a race between that unit's own `TTYPath`
+setup and getty still holding the tty; splitting them lets
+`cmd_wifi_recovery_check` call `systemctl stop getty@tty1.service`
+(blocks until fully stopped) and only then `systemctl start
+wifi-recovery-console.service` (which runs `cmd_wifi_recovery_console`),
+eliminating the race. `wifi-recovery-console.service` is never enabled —
+only ever started this way. A `trap ... EXIT` in
+`cmd_wifi_recovery_check` always restores `getty@tty1` afterward, even if
+the console unit errors or is interrupted. This is also why these two
+pieces stay two separate systemd units even though the *scripts* were
+consolidated into one file — the unit split reflects a real TTY-ownership
+boundary, not just code organization.
+
+**A consolidation gotcha worth knowing if you touch this code**: both
+subcommands were originally standalone scripts with `set -uo pipefail`
+(no `-e`), since nmcli/whiptail returning non-zero — Cancel pressed, a
+connect attempt failing — is normal control flow there, not a script
+error. `maintenance.sh` itself uses the stricter `set -euo pipefail`.
+Moving the code in without accounting for that difference would have been
+a real regression: under `-e`, an unguarded failing command aborts the
+*entire* `maintenance.sh` process immediately at that line, even one
+followed by an explicit `return` on the very next line — e.g. pressing
+Escape on a plain informational `--msgbox` would otherwise kill the whole
+recovery console instead of just dismissing that dialog. Every
+nmcli/whiptail call in `cmd_wifi_recovery_console` and its `wifi_*` helper
+functions is explicitly guarded (`|| true`, `|| return 0`) as a result —
+keep that guard when editing or adding to this code.
+
+**Verified live on the real device** (stopping `getty@tty1` and manually
+starting `wifi-recovery-console.service` over SSH, confirmed via `ps` and
+`/proc/<pid>/cmdline` byte inspection — not by physically watching a
+screen): the console correctly attaches to tty1, reads live `nmcli`
+state, renders real newlines (not literal `\n` — an actual bug caught and
+fixed this way), and `getty@tty1` is cleanly restored afterward. Re-run
+after any change to this code — same commands, no monitor needed:
+```bash
+sudo /opt/pi-config-ui/maintenance.sh wifi-recovery-check   # HDMI disconnected -> should no-op, check the journal
+sudo journalctl -t pi-config-ui-maintenance --no-pager -n 5
+sudo systemctl stop getty@tty1.service
+sudo systemctl start --no-block wifi-recovery-console.service
+sleep 3 && ps aux | grep whiptail   # confirm it attached to tty1
+sudo systemctl stop wifi-recovery-console.service
+sudo systemctl start getty@tty1.service   # confirm this comes back cleanly
+```
+**Not verified, and can't be without physical access**: the actual visual
+rendering on a real monitor, and a genuine HDMI hotplug event triggering
+the udev path — test both once you have physical access.
+
+**Install** (already wired into `deploy/deploy.sh`'s `install_wifi_recovery`,
+run as part of a full `./deploy/deploy.sh` pass):
+```bash
+sudo cp deploy/wifi-recovery-check.service /etc/systemd/system/
+sudo cp deploy/wifi-recovery-console.service /etc/systemd/system/
+sudo cp deploy/udev-rules/99-wifi-recovery.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo systemctl daemon-reload
+sudo systemctl enable wifi-recovery-check.service   # not wifi-recovery-console — never enabled
+```
+
 ## 2. Install the app
 
 ```bash

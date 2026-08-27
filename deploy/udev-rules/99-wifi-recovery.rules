@@ -1,0 +1,20 @@
+# Concept: Mukesh Kesharwani
+# Contact: mukesh.kesharwani@adobe.com
+#
+# Fires wifi-recovery-check.service on any DRM connector state change
+# (plugging/unplugging any display, not just HDMI specifically — the
+# kernel's "change" uevent on the card doesn't say which connector
+# changed or to what, only that something did). The service itself is the
+# real gate: it checks /sys/class/drm/card*-HDMI-A-1/status directly and
+# is a safe no-op if that isn't "connected", so an unrelated DRM event
+# (or unplugging the monitor) just costs one cheap, instant check.
+#
+# --no-block: udev's event processing must not wait on this — it can
+# block for the full HDMI+connectivity check (and potentially the whole
+# interactive recovery console) otherwise, stalling every other udev
+# event on the system in the meantime.
+#
+# Install: sudo cp deploy/udev-rules/99-wifi-recovery.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload-rules
+
+SUBSYSTEM=="drm", ACTION=="change", RUN+="/usr/bin/systemctl start --no-block wifi-recovery-check.service"
