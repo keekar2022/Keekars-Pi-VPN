@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-from app import __version__, monitor, network, routing, wireguard
+from app import __version__, monitor, network, routing, system, wireguard
 from app.auth import current_user, router as auth_router
 from app.config import settings
 
@@ -57,6 +57,7 @@ app.include_router(auth_router)
 app.include_router(network.router)
 app.include_router(routing.router)
 app.include_router(monitor.router)
+app.include_router(system.router)
 app.include_router(wireguard.router)
 
 

@@ -549,6 +549,66 @@ Disk %, computed by `app/monitor.py` and rendered by
   install) is rendered client-side via `formatDuration()` in
   `dashboard.js` as the largest two units (e.g. "2h 14m").
 
+## 5f. Dashboard Uptime stat and Reboot/Shutdown buttons
+
+**Uptime** (`app/monitor.py`'s `_uptime_seconds()`): reads the first field
+of `/proc/uptime` (kernel-monotonic seconds since boot), deliberately
+*not* `psutil.boot_time()` — that's the same wall-clock value §5e already
+found unreliable pre-NTP-sync on this hardware. `/proc/uptime` is immune
+to that whole class of bug, so no NTP-gating is needed here; it's a
+simpler, independent stat from "Last downtime," just displayed in the
+tile next to it via the same `formatDuration()`.
+
+**Reboot/Shutdown** (`app/system.py`, new `/api/system/reboot` and
+`/api/system/shutdown` endpoints): `pi-config-ui.service` runs
+deliberately unprivileged (§7), so triggering a real reboot/shutdown
+needs an explicit, narrow privilege grant rather than a blanket one.
+`systemctl reboot`/`systemctl poweroff`, invoked by a non-root caller,
+redirect to logind's D-Bus API specifically so polkit can gate them
+per-user — the same mechanism (and same `subject.user === "pi-config-ui"`
+pattern) `50-pi-config-ui-networkmanager.rules` already uses for
+NetworkManager, just different action IDs.
+
+**A real gotcha found via live testing, not just `pkcheck` in isolation**:
+`pkcheck --action-id org.freedesktop.login1.reboot --process <pid>`
+returning "allowed" is **not sufficient** to prove the button actually
+works. The first version of `51-pi-config-ui-power.rules` granted only
+the plain `org.freedesktop.login1.reboot`/`.power-off` actions, and
+`pkcheck` against that action confirmed authorization — but a real
+`systemctl reboot` invocation still failed with "Interactive
+authentication required." `busctl monitor --system` while retrying
+showed why: logind's `CheckAuthorization` call was actually for
+`org.freedesktop.login1.reboot-multiple-sessions`, a *different* action
+it switches to whenever any other logind session is active at the
+moment — e.g. an admin SSH'd into the Pi at the same time they click
+Reboot in the dashboard, a very plausible real scenario, not an edge
+case. `51-pi-config-ui-power.rules` grants **all four**:
+`reboot`/`reboot-multiple-sessions`/`power-off`/`power-off-multiple-sessions`.
+No new root helper daemon needed either way, unlike WireGuard's
+`pi-wg-helperd`. Independent of `maintenance.sh`'s existing scheduled
+`reboot` subcommand (root, cron-triggered, §5) — this is a second,
+separate path to the same underlying action for on-demand use from the
+UI.
+
+The dashboard's Shutdown button is deliberately styled and worded as more
+severe than Reboot (`confirm()` text spells out that it will **not** come
+back on its own, unlike the WireGuard "force" confirmation pattern this
+reuses) — this hardware has no remote-wake path, so shutting it down
+means someone needs physical access to power it back on.
+
+**Verify — do the real thing, `pkcheck` alone isn't proof:**
+```bash
+PID=$(systemctl show pi-config-ui -p MainPID --value)
+sudo pkcheck --action-id org.freedesktop.login1.reboot --process "$PID"                  # sanity check only
+sudo pkcheck --action-id org.freedesktop.login1.reboot-multiple-sessions --process "$PID" # the one that actually matters if you're SSH'd in
+sudo -u pi-config-ui systemctl reboot   # the real thing — confirmed working live, including while SSH'd in
+```
+Then `pytest` (mocks `_run_systemctl`, doesn't invoke the real binary).
+Confirmed live end-to-end this way: the reboot actually happened, the Pi
+came back up (~2.5 minutes, consistent with §0/§14), and `pi-config-ui`
+was healthy again afterward with no rollback alert (expected — this
+wasn't an update-triggered reboot, §5d doesn't apply here).
+
 ## 6. Groups before services — order matters
 
 `pi-config-ui.service` references `SupplementaryGroups=pi-wg-helper`. If

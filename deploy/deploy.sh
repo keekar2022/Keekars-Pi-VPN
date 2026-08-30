@@ -271,6 +271,7 @@ cp /opt/pi-config-ui/deploy/pi-wg-helperd/helper.py /opt/pi-wg-helperd/helper.py
 chown root:root /opt/pi-wg-helperd/helper.py
 chmod 755 /opt/pi-wg-helperd/helper.py
 cp /opt/pi-config-ui/deploy/polkit-rules/50-pi-config-ui-networkmanager.rules /etc/polkit-1/rules.d/
+cp /opt/pi-config-ui/deploy/polkit-rules/51-pi-config-ui-power.rules /etc/polkit-1/rules.d/
 systemctl daemon-reload
 systemctl enable pi-config-ui pi-wg-helperd pi-config-ui-boot-check
 REMOTE

@@ -14,6 +14,7 @@
   <div class="stat-tile"><span id="mem-value">--</span>%<div class="stat-label">Memory</div></div>
   <div class="stat-tile"><span id="disk-value">--</span>%<div class="stat-label">Disk</div></div>
   <div class="stat-tile"><span id="downtime-value">--</span><div class="stat-label">Last downtime</div></div>
+  <div class="stat-tile"><span id="uptime-value">--</span><div class="stat-label">Uptime</div></div>
 </div>
 
 <canvas id="cpuChart" height="80"></canvas>
@@ -42,6 +43,13 @@
 </div>
 
 <p id="monitor-status"></p>
+
+<h2>Power</h2>
+<div class="stat-row">
+  <button id="reboot-button" type="button">Reboot</button>
+  <button id="shutdown-button" type="button">Shutdown</button>
+</div>
+<p id="power-status"></p>
 
 <script src="/static/vendor/chart.umd.min.js"></script>
 <script src="/static/dashboard.js"></script>

@@ -1,0 +1,38 @@
+// Concept: Mukesh Kesharwani
+// Contact: mukesh.kesharwani@adobe.com
+//
+// Grants the unprivileged pi-config-ui service user exactly the logind
+// actions its dashboard's Reboot/Shutdown buttons need (app/system.py) —
+// not a blanket allow. `systemctl reboot`/`poweroff`, invoked by a
+// non-root caller, redirect to logind's D-Bus API specifically so polkit
+// can gate them per-user this way; no new root helper daemon needed.
+// Separate file from 50-pi-config-ui-networkmanager.rules — different
+// concern, same subject.user === "pi-config-ui" pattern.
+//
+// Both the plain AND "-multiple-sessions" variants are required: logind
+// picks between org.freedesktop.login1.reboot and
+// .reboot-multiple-sessions (same for power-off) depending on whether any
+// *other* logind session is active at the moment of the call — confirmed
+// via `busctl monitor` that an admin SSH'd into the Pi at the same time
+// they click Reboot in the dashboard hits the "-multiple-sessions"
+// variant specifically, which the plain action alone does NOT cover.
+// Granting only "reboot" appeared to work when tested via `pkcheck
+// --action-id org.freedesktop.login1.reboot` in isolation, but the real
+// button click still failed with "Interactive authentication required"
+// under this exact (very plausible) admin-is-also-SSH'd-in scenario —
+// this is why both variants must be granted, not just the one a
+// narrower/simpler check would suggest is sufficient.
+
+polkit.addRule(function (action, subject) {
+  const allowedActions = [
+    "org.freedesktop.login1.reboot",
+    "org.freedesktop.login1.reboot-multiple-sessions",
+    "org.freedesktop.login1.power-off",
+    "org.freedesktop.login1.power-off-multiple-sessions",
+  ];
+
+  if (allowedActions.indexOf(action.id) !== -1 && subject.user === "pi-config-ui") {
+    return polkit.Result.YES;
+  }
+  return polkit.Result.NOT_HANDLED;
+});

@@ -224,6 +224,40 @@ correction happens. Every read/compare/persist of `boot_time()` is gated
 on `/run/systemd/timesync/synchronized` existing first; see
 `docs/RUNBOOK.md` §5e for the resulting design.
 
+### Incident: `pkcheck` said yes, the real reboot button said no
+
+Adding dashboard Reboot/Shutdown buttons (`app/system.py`) needed a
+polkit grant for the unprivileged `pi-config-ui` user, mirroring how
+`50-pi-config-ui-networkmanager.rules` already grants NetworkManager
+actions. Before writing any code, confirmed the mechanism with `pkcheck
+--action-id org.freedesktop.login1.reboot --process <pi-config-ui PID>`:
+denied with no rule, allowed once a rule granting exactly `.reboot`/
+`.power-off` was installed. Reasonable confidence going in — this is the
+same verify-before-building approach used for every other privilege grant
+on this project.
+
+It wasn't enough. Live-testing the actual command
+(`sudo -u pi-config-ui systemctl reboot`, run over an active SSH session)
+failed with "Interactive authentication required" despite `pkcheck`
+saying the action was allowed moments earlier. `busctl monitor --system`
+while retrying showed the real `CheckAuthorization` call was for
+`org.freedesktop.login1.reboot-multiple-sessions` — a *different* action
+ID logind switches to specifically because another logind session (the
+SSH login itself) was active at that moment. The rule only covered the
+plain `.reboot` action, which was never actually the one being checked
+once a second session existed. Fixed by granting both the plain and
+`-multiple-sessions` variants of both `reboot` and `power-off`.
+
+The lesson isn't "add more actions" so much as: a targeted `pkcheck`
+against the specific action you *assume* is being checked can pass while
+the real call path checks something else entirely — especially for logind,
+which picks between action IDs based on runtime session state, not just
+the operation name. Confirming a privilege grant this way requires
+running the actual privileged command, in the actual conditions it'll run
+under (here: with a concurrent SSH session, the realistic case for an
+admin who'd have SSH open while also using the dashboard) — not just an
+isolated authorization check for the action you expect to be relevant.
+
 ## Part 2 — Dual-mode WireGuard design (client wg0-role + server Bpl-Home)
 
 ### Requirements and the decision that shaped the design

@@ -174,6 +174,20 @@ def _top_processes():
     return top_cpu, top_mem
 
 
+def _uptime_seconds() -> float | None:
+    # /proc/uptime's first field is kernel-monotonic seconds since boot —
+    # deliberately not psutil.boot_time(), which is wall-clock-derived and
+    # was already found unreliable pre-NTP-sync on this hardware (see the
+    # downtime-tracking heartbeat above and docs/PROJECT_NOTES.md). Uptime
+    # doesn't need any of that NTP-gating machinery since this value is
+    # immune to that class of bug entirely.
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 @router.get("/stats")
 async def stats():
     global _last_counters, _last_time
@@ -206,6 +220,7 @@ async def stats():
         "top_cpu": top_cpu,
         "top_mem": top_mem,
         "last_downtime_seconds": _last_downtime_seconds,
+        "uptime_seconds": _uptime_seconds(),
         "rollback_alert": _load_rollback_alert(),
     }
 

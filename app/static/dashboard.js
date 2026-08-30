@@ -81,6 +81,8 @@ async function pollStats() {
     document.getElementById("disk-value").textContent = data.disk_percent.toFixed(1);
     document.getElementById("downtime-value").textContent =
       data.last_downtime_seconds != null ? formatDuration(data.last_downtime_seconds) : "—";
+    document.getElementById("uptime-value").textContent =
+      data.uptime_seconds != null ? formatDuration(data.uptime_seconds) : "—";
     renderRollbackAlert(data.rollback_alert);
     statusEl.textContent = "";
 
@@ -121,6 +123,50 @@ async function pollStats() {
     statusEl.className = "error";
   }
 }
+
+async function triggerPowerAction(endpoint, confirmMessage, pendingMessage) {
+  // Same confirm() pattern already used for the WireGuard tab's
+  // force-activate flow — not a new UI convention.
+  if (!confirm(confirmMessage)) return;
+
+  const statusEl = document.getElementById("power-status");
+  statusEl.textContent = pendingMessage;
+  statusEl.className = "";
+  document.getElementById("reboot-button").disabled = true;
+  document.getElementById("shutdown-button").disabled = true;
+
+  try {
+    const res = await fetch(endpoint, { method: "POST" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    // No further UI update expected past this point — the box is going
+    // down. Stop polling stats so pollStats() doesn't immediately
+    // overwrite this message with a connection-error status once the
+    // server actually stops responding.
+    if (pollTimer) clearInterval(pollTimer);
+  } catch (err) {
+    statusEl.textContent = `Failed to start: ${err.message}`;
+    statusEl.className = "error";
+    document.getElementById("reboot-button").disabled = false;
+    document.getElementById("shutdown-button").disabled = false;
+  }
+}
+
+document.getElementById("reboot-button").addEventListener("click", () => {
+  triggerPowerAction(
+    "/api/system/reboot",
+    "Reboot this Pi now? This briefly drops the VPN and all connected peers.",
+    "Rebooting… this page will stop responding until it comes back up."
+  );
+});
+
+document.getElementById("shutdown-button").addEventListener("click", () => {
+  triggerPowerAction(
+    "/api/system/shutdown",
+    "Shut down this Pi now? Unlike Reboot, it will NOT come back on its own — " +
+      "someone needs physical access to power it back on. Are you sure?",
+    "Shutting down… this device will not come back without physical access."
+  );
+});
 
 pollStats();
 pollTimer = setInterval(pollStats, POLL_INTERVAL_MS);
