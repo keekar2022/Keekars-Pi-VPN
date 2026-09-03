@@ -38,12 +38,13 @@ health-check-and-restart (every 10 min — including restarting any
 client-role tunnels are never touched, see §9.4), a DDNS updater (also
 every 10 min — see §5c), a TLS cert-expiry health check (real renewal
 happens independently via acme.sh's own cron + reload hook — see §5b),
-weekly disk/log cleanup, a weekly `apt-get update`/`upgrade` on
-Wednesdays at 05:00 (conservative `upgrade`, not `dist-upgrade`; also
+weekly disk/log cleanup, a weekly `apt-get update` plus guarded
+`full-upgrade --no-remove` on Wednesdays at 05:00 (allows required new packages
+such as versioned kernels but aborts rather than removing anything; it also
 snapshots pre-upgrade package versions for §5d's rollback path), and an
-unconditional weekly reboot Wednesdays at 05:30 — right after that same
-update, not days later, so a regression is caught the same morning (see
-§5d for the full failsafe this enables). It also installs
+unconditional weekly reboot Wednesdays at 05:35. System-changing tasks share a lock, so the
+reboot waits for an in-flight update and health checks skip while either is
+running (see §5d for the full failsafe this enables). It also installs
 `pi-config-ui-boot-check.service` (§5d — a post-boot health check that
 restarts/best-effort-rolls-back and alerts if something's broken; also
 see §5e for the related "how long was this device down" dashboard
@@ -444,10 +445,10 @@ anything routed to me" half.
 
 ## 5d. Boot-health failsafe and update-rollback alert
 
-The weekly `os-update` (Wednesdays 05:00) and `reboot` (Wednesdays 05:30,
-deliberately right after `os-update` rather than days later, so a
-regression is caught and confirmed/reverted the same morning) cron jobs
-run completely unattended. `pi-config-ui-boot-check.service` (a root-run
+The weekly `os-update` (Wednesdays 05:00) and `reboot` (Wednesdays 05:35)
+cron jobs run completely unattended. A shared system-maintenance lock makes the
+reboot wait for an in-flight update and prevents the frequent health check
+from restarting services during either operation. `pi-config-ui-boot-check.service` (a root-run
 oneshot unit, `deploy/pi-config-ui-boot-check.service`, `After=
 pi-config-ui.service`) runs once per boot to catch the realistic failure
 mode: the system boots, but `pi-config-ui` or a package it needs is
@@ -466,7 +467,7 @@ timeout) — so a full kernel panic or PID 1 hang already triggers an
 automatic hard reboot on its own.
 
 **What it does cover**: `cmd_os_update` (`deploy/maintenance.sh`), before
-running `apt-get upgrade`, snapshots every package about to change into
+running `apt-get full-upgrade --no-remove`, snapshots every package about to change into
 `/etc/pi-config-ui/monitor/pkg-backups/<timestamp>/` — recording
 `pkg=current_version` and best-effort copying that exact `.deb` from
 `/var/cache/apt/archives/` *if it's still cached there*. This is not

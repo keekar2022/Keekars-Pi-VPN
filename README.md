@@ -129,7 +129,10 @@ sudo systemctl restart pi-config-ui   # picks up the new ReadWritePaths/Suppleme
 
 `deploy/maintenance.sh`, installed by `deploy/deploy.sh` as a cron.d
 drop-in, handles health-check-and-restart, TLS renewal monitoring, DDNS,
-weekly OS updates, log rotation, and a scheduled weekly reboot. A
+weekly OS updates, log rotation, and a scheduled weekly reboot. OS updates
+allow required new dependency packages (including versioned kernels) but
+abort rather than removing installed packages. System-changing maintenance
+tasks are serialized so an update cannot overlap a health restart or reboot. A
 companion systemd unit, `pi-config-ui-boot-check.service`, runs once per
 boot to catch the realistic failure mode of an unattended update: it
 retries a service restart, attempts a best-effort package rollback if a

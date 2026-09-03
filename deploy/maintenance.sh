@@ -39,6 +39,37 @@ log() {
 # its own keys (pending_update_backup, rollback_attempted), never touches
 # the downtime-tracking fields the app itself owns.
 _STATE_FILE=/etc/pi-config-ui/monitor/state.json
+_SYSTEM_LOCK_FILE=/run/lock/pi-config-ui-system-maintenance.lock
+
+# Prevent service recovery, package maintenance, boot rollback, and reboot
+# from changing system state at the same time. Frequent health checks skip
+# while a longer task owns the lock; reboot waits for an in-flight update so
+# it can never interrupt dpkg halfway through a transaction.
+run_system_locked() {
+  local wait_seconds="$1" operation="$2"
+  shift 2
+
+  local lock_fd
+  exec {lock_fd}>"$_SYSTEM_LOCK_FILE"
+  if [ "$wait_seconds" -eq 0 ]; then
+    if ! flock -n "$lock_fd"; then
+      log "INFO: $operation: another system-maintenance task is active, skipping this run"
+      exec {lock_fd}>&-
+      return 75
+    fi
+  elif ! flock -w "$wait_seconds" "$lock_fd"; then
+    log "ERROR: $operation: timed out waiting ${wait_seconds}s for the system-maintenance lock"
+    exec {lock_fd}>&-
+    return 75
+  fi
+
+  # This script dispatches exactly one operation and then exits, so leaving
+  # the descriptor open here intentionally holds the lock through the whole
+  # operation. Calling the function directly also preserves `set -e` inside
+  # the operation; wrapping it in an `if`/`||` status capture would disable
+  # Bash errexit semantics throughout a called shell function.
+  "$@"
+}
 
 state_get() {
   python3 -c "
@@ -166,19 +197,18 @@ cmd_cleanup() {
 }
 
 cmd_os_update() {
-  # Plain `upgrade`, not `dist-upgrade` — on a device with no easy physical
-  # recovery, avoid letting apt remove/replace packages to satisfy new
-  # dependencies unattended; a conservative upgrade is the safer default
-  # here. ForceIPv4 matches deploy.sh's install_dependencies (this Pi's
-  # IPv6 path to some hosts has been observed unreachable). --force-confdef
-  # / --force-confold auto-resolve conffile prompts instead of hanging
-  # cron waiting for interactive input that will never come.
+  # `full-upgrade --no-remove` permits versioned kernel packages and other
+  # required new dependencies, while aborting rather than removing an
+  # installed package. Plain `apt-get upgrade` permanently kept those kernel
+  # updates back on this device. ForceIPv4 matches deploy.sh's dependency
+  # install; the lock timeout tolerates overlap with the OS apt timers.
+  # --force-confdef/--force-confold resolve conffile prompts non-interactively.
   export DEBIAN_FRONTEND=noninteractive
-  local apt_opts=(-o Acquire::ForceIPv4=true -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+  local apt_opts=(-o Acquire::ForceIPv4=true -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 
   if ! apt-get "${apt_opts[@]}" update -qq; then
-    log "ERROR: os-update: apt-get update failed — check /var/log/apt/term.log"
-    return 0
+    log "ERROR: os-update: apt-get update failed — check /var/log/pi-config-ui-maintenance.log"
+    return 1
   fi
 
   # Best-effort pre-upgrade snapshot for cmd_boot_check's rollback path
@@ -191,8 +221,15 @@ cmd_os_update() {
   local backup_dir
   backup_dir="/etc/pi-config-ui/monitor/pkg-backups/$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$backup_dir"
-  apt-get "${apt_opts[@]}" upgrade -y -qq --simulate 2>/dev/null \
-    | awk '/^Inst/ {print $2}' > "$backup_dir/pkgnames.txt" || true
+  if ! apt-get "${apt_opts[@]}" full-upgrade --no-remove -y -qq --simulate \
+      > "$backup_dir/apt-plan.txt" 2>&1; then
+    log "ERROR: os-update: safe full-upgrade simulation failed or requires package removal"
+    cat "$backup_dir/apt-plan.txt"
+    rm -rf "$backup_dir"
+    return 1
+  fi
+  awk '/^Inst/ {print $2}' "$backup_dir/apt-plan.txt" > "$backup_dir/pkgnames.txt"
+  rm -f "$backup_dir/apt-plan.txt"
   if [ -s "$backup_dir/pkgnames.txt" ]; then
     : > "$backup_dir/packages.txt"
     while read -r pkg; do
@@ -210,10 +247,11 @@ cmd_os_update() {
   # Keep only the 2 most recent snapshots — bounded disk use.
   ls -1dt /etc/pi-config-ui/monitor/pkg-backups/*/ 2>/dev/null | tail -n +3 | xargs -r rm -rf
 
-  if apt-get "${apt_opts[@]}" upgrade -y -qq; then
+  if apt-get "${apt_opts[@]}" full-upgrade --no-remove -y -qq; then
     log "os-update: apt update/upgrade completed"
   else
-    log "ERROR: os-update: apt update/upgrade failed — check /var/log/apt/term.log"
+    log "ERROR: os-update: safe full-upgrade failed — check /var/log/pi-config-ui-maintenance.log"
+    return 1
   fi
   # Deliberately does not reboot itself — a kernel/library upgrade needing
   # a reboot to take effect is far less risky than an unattended reboot of
@@ -236,19 +274,21 @@ cmd_os_update() {
   # upstream for a human to decide on, mirroring cert-renew's expiry
   # warning and the reboot-required warning above.
   local venv=/opt/pi-config-ui/venv
+  local pip_status=0
   if [ -x "$venv/bin/pip" ]; then
-    if sudo -u pi-config-ui "$venv/bin/pip" install -q --timeout 60 \
+    if sudo -u pi-config-ui env PIP_NO_CACHE_DIR=1 "$venv/bin/pip" install -q --timeout 60 \
         --index-url https://www.piwheels.org/simple \
         -r /opt/pi-config-ui/requirements.txt; then
       log "os-update: pip deps re-synced to requirements.txt pins"
     else
       log "ERROR: os-update: pip sync failed — check the output above in /var/log/pi-config-ui-maintenance.log"
+      pip_status=1
     fi
 
     # piwheels can lag behind PyPI for brand-new releases — informational
     # only, not a reason to fail this step.
     local outdated
-    outdated=$(sudo -u pi-config-ui "$venv/bin/pip" list --outdated --timeout 60 \
+    outdated=$(sudo -u pi-config-ui env PIP_NO_CACHE_DIR=1 "$venv/bin/pip" list --outdated --timeout 60 \
       --index-url https://www.piwheels.org/simple 2>/dev/null | tail -n +3) || true
     if [ -n "$outdated" ]; then
       log "WARNING: os-update: newer versions available upstream (requirements.txt pins left untouched — review and bump manually): $(echo "$outdated" | tr '\n' ';' | sed 's/;$//')"
@@ -256,6 +296,7 @@ cmd_os_update() {
   else
     log "os-update: no venv at $venv, skipping pip sync"
   fi
+  return "$pip_status"
 }
 
 cmd_ddns_update() {
@@ -679,13 +720,13 @@ cmd_wifi_recovery_console() {
 }
 
 case "${1:-}" in
-  health) cmd_health ;;
+  health) run_system_locked 0 health cmd_health ;;
   cert-renew) cmd_cert_renew ;;
-  cleanup) cmd_cleanup ;;
-  os-update) cmd_os_update ;;
+  cleanup) run_system_locked 0 cleanup cmd_cleanup ;;
+  os-update) run_system_locked 0 os-update cmd_os_update ;;
   ddns-update) cmd_ddns_update ;;
-  reboot) cmd_reboot ;;
-  boot-check) cmd_boot_check ;;
+  reboot) run_system_locked 7200 reboot cmd_reboot ;;
+  boot-check) run_system_locked 0 boot-check cmd_boot_check ;;
   wifi-recovery-check) cmd_wifi_recovery_check ;;
   wifi-recovery-console) cmd_wifi_recovery_console ;;
   *) echo "Usage: $0 {health|cert-renew|cleanup|os-update|ddns-update|reboot|boot-check|wifi-recovery-check|wifi-recovery-console}" >&2; exit 1 ;;

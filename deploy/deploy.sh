@@ -302,6 +302,10 @@ set_permissions() {
 set -euo pipefail
 chown -R pi-config-ui:pi-config-ui /opt/pi-config-ui
 chown -R pi-config-ui:pi-config-ui /etc/pi-config-ui/tls /etc/pi-config-ui/wireguard /etc/pi-config-ui/monitor
+# Package rollback artifacts are consumed by a root-run systemd service and
+# must not be replaceable by the unprivileged web application.
+chown -R root:root /etc/pi-config-ui/monitor/pkg-backups
+chmod 755 /etc/pi-config-ui/monitor/pkg-backups
 if [ -f /etc/pi-config-ui/sso.env ]; then
   chown pi-config-ui:pi-config-ui /etc/pi-config-ui/sso.env
   chmod 600 /etc/pi-config-ui/sso.env
@@ -328,17 +332,17 @@ cat > /etc/cron.d/pi-config-ui-maintenance <<'CRON'
 # Concept: Mukesh Kesharwani
 # Contact: mukesh.kesharwani@adobe.com
 # Managed by deploy/deploy.sh — edits here are overwritten on next deploy.
-*/10 * * * * root /opt/pi-config-ui/maintenance.sh health >> /var/log/pi-config-ui-maintenance.log 2>&1
-*/10 * * * * root /opt/pi-config-ui/maintenance.sh ddns-update >> /var/log/pi-config-ui-maintenance.log 2>&1
+2,12,22,32,42,52 * * * * root /opt/pi-config-ui/maintenance.sh health >> /var/log/pi-config-ui-maintenance.log 2>&1
+7,17,27,37,47,57 * * * * root /opt/pi-config-ui/maintenance.sh ddns-update >> /var/log/pi-config-ui-maintenance.log 2>&1
 0 3 * * * root /opt/pi-config-ui/maintenance.sh cert-renew >> /var/log/pi-config-ui-maintenance.log 2>&1
 0 4 * * 0 root /opt/pi-config-ui/maintenance.sh cleanup >> /var/log/pi-config-ui-maintenance.log 2>&1
 0 5 * * 3 root /opt/pi-config-ui/maintenance.sh os-update >> /var/log/pi-config-ui-maintenance.log 2>&1
-30 5 * * 3 root /opt/pi-config-ui/maintenance.sh reboot >> /var/log/pi-config-ui-maintenance.log 2>&1
+35 5 * * 3 root /opt/pi-config-ui/maintenance.sh reboot >> /var/log/pi-config-ui-maintenance.log 2>&1
 CRON
 chmod 644 /etc/cron.d/pi-config-ui-maintenance
 touch /var/log/pi-config-ui-maintenance.log
 
-# Never rotated otherwise: five cron jobs above (two every 10 minutes)
+# Never rotated otherwise: six cron jobs above (two every 10 minutes)
 # append to this file forever. logrotate itself is already installed and
 # run daily by the OS (Raspbian default) — this just gives it a target.
 cat > /etc/logrotate.d/pi-config-ui-maintenance <<'LOGROTATE'
