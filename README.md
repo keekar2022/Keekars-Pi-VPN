@@ -9,6 +9,13 @@ targets (single-core 1GHz ARMv6, 512MB RAM), chosen deliberately to prove
 this all runs comfortably on minimal hardware rather than assuming a
 beefier Pi.
 
+**Supported boards (v1.0.2):** Raspberry Pi Zero W on Raspberry Pi OS
+(`armhf`) and **Walnut Pi Zero W on Armbian** (`arm64`). `deploy/deploy.sh`
+detects the board's package set, Python wheel source, and network stack
+(it hands Armbian's netplan/systemd-networkd Wi-Fi over to NetworkManager
+with an automatic rollback). DDNS publishes both IPv4 (`A`) and IPv6
+(`AAAA`) records. See [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md).
+
 ## What this is
 
 A lightweight FastAPI web UI (`app/`) that turns a Raspberry Pi into a
@@ -44,11 +51,13 @@ remotely manageable home VPN gateway:
   self-inflicted SSH lockout and its recovery.
 - Already familiar with the setup and just need a quick command reference
   → keep reading below.
+- What changed in each version → [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md).
 
 ## Project status
 
-Actively developed and running in production on a real Pi Zero W as a
-home VPN. **Estimated effort invested to date (as of 2026-08-27): ~100
+Actively developed and running in production as a home VPN on two devices:
+a Raspberry Pi Zero W (now at a remote site in Bhopal) and a Walnut Pi Zero
+W on Armbian (Sydney). **Estimated effort invested to date (as of 2026-08-27): ~100
 hours** — spanning initial stack research and SSO integration, the
 dual-mode WireGuard design, TLS/DDNS automation, the boot-health failsafe,
 dashboard monitoring, and recovering from close to a dozen real incidents
@@ -56,16 +65,21 @@ documented in [`docs/PROJECT_NOTES.md`](docs/PROJECT_NOTES.md). This is an
 approximate figure based on the scope of documented work, not a tracked
 timesheet.
 
-## Install on-device (Pi Zero W)
+## Install on-device
 
-Use piwheels so C-extension dependencies (psutil, pyroute2) install as
-prebuilt `armv6l` wheels instead of compiling from source:
+On 32-bit Raspberry Pi OS (`armhf`), use piwheels so C-extension
+dependencies (psutil, pyroute2) install as prebuilt `armv6l` wheels instead
+of compiling from source:
 
 ```
 python3 -m venv venv
 source venv/bin/activate
 pip install --index-url https://www.piwheels.org/simple -r requirements.txt
 ```
+
+On arm64 boards (Walnut Pi / Armbian), piwheels has no wheels — plain
+`pip install -r requirements.txt` gets prebuilt aarch64 wheels from PyPI.
+`deploy/deploy.sh` picks the right source automatically.
 
 ## Configuration
 
@@ -101,6 +115,19 @@ sudo systemctl enable --now pi-config-ui
 Or use the fully automated path — `./deploy/deploy.sh` drives all of this
 (and the WireGuard helper, maintenance cron jobs, and boot-health failsafe
 below) over SSH from your own machine; see `docs/RUNBOOK.md` for details.
+Each device needs its own hostnames on the first deploy (saved on the
+device in `/etc/pi-config-ui/device.env`, so later runs omit them):
+
+```
+PI_HOST=root@192.168.1.24 CERT_CN=vpn2.bpl.keekar.au \
+  WIFI_EXTRA_SSIDS="keekar5G" ./deploy/deploy.sh
+# device at a remote site: admin name resolves to its public IP
+PI_HOST=mkesharw@10.6.0.6 CERT_CN=vpn.bpl.keekar.au ADMIN_RECORD_TARGET=public \
+  ./deploy/deploy.sh --skip-deps
+```
+
+The Cloudflare token (for the Let's Encrypt cert and DDNS) is read from
+`pass show KeekarACI/Cloudflare` and piped straight to the device.
 
 ### WireGuard tab
 
@@ -140,6 +167,14 @@ recent update is implicated, and always raises an alert — readable over
 SSH and shown as a banner on the dashboard — rather than failing silently.
 See `docs/RUNBOOK.md` §5d/§5e for exactly what this does and does not
 cover.
+
+DDNS (`maintenance.sh ddns-update`, every 10 minutes) keeps only this
+device's own records current: the WireGuard endpoint gets the public IPv4
+(`A`) and stable global IPv6 (`AAAA`), and the admin name gets the LAN IP
+or, with `ADMIN_RECORD_TARGET=public`, the public IPv4. `maintenance.sh
+wg-guard` runs after every `wg-quick` start and every 10 minutes, and
+removes any client-tunnel `AllowedIPs` range that overlaps the local LAN —
+the cause of a real SSH lockout (`docs/PROJECT_NOTES.md` Part 3).
 
 ## Tests
 

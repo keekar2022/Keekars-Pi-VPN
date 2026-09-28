@@ -19,34 +19,61 @@
 #   ./deploy/deploy.sh                  # full bootstrap + update
 #   ./deploy/deploy.sh --skip-deps      # skip apt/pip install (faster iteration)
 #   ./deploy/deploy.sh --only <func>    # run a single function by name
-#   PI_HOST=user@host ./deploy/deploy.sh
-#   CERT_CN=your.hostname ./deploy/deploy.sh   # only used the first time a
-#                                                # TLS cert is generated
-#   ACME_EMAIL=you@example.com ./deploy/deploy.sh   # required only to
-#     # provision a real (Let's Encrypt) cert via provision_tls_cert; also
-#     # requires a Cloudflare API token dropped at /root/.cf-dns-token on
-#     # the Pi (see docs/RUNBOOK.md §5b — never supplied by this script).
-#     # Leave ACME_EMAIL unset to keep the self-signed cert from
-#     # bootstrap_system.
+#   PI_HOST=user@host ./deploy/deploy.sh      # required, e.g. root@192.168.1.24
+#
+# First deploy of a NEW device (each device needs its own names, or it
+# overwrites another device's DNS records):
+#   PI_HOST=root@<ip> CERT_CN=vpn2.bpl.keekar.au \
+#     WIFI_EXTRA_SSIDS="keekar5G" ./deploy/deploy.sh
+#
+#   CERT_CN           admin UI hostname; saved on the Pi in
+#                     /etc/pi-config-ui/device.env, so later runs omit it.
+#   DDNS_RECORD_NAME  WireGuard public endpoint; defaults to CERT_CN with
+#                     vpn -> wg (vpn2.bpl.keekar.au -> wg2.bpl.keekar.au).
+#   ADMIN_RECORD_TARGET  lan (default) or public: which IP CERT_CN resolves
+#                     to. Use public for a device at a remote site whose LAN
+#                     isn't reachable (e.g. Bhopal); saved in device.env.
+#   CF_PASS_ENTRY     `pass` entry holding API_TOKEN=<Cloudflare token with
+#                     Zone:DNS:Edit on keekar.au> and Account_ID=<id>;
+#                     default KeekarACI/Cloudflare, set empty to skip.
+#                     Copied to /root/.cf-dns-token (mode 600); enables
+#                     the Let's Encrypt cert and DNS registration.
+#   ACME_EMAIL        optional Let's Encrypt account email.
+#   WIFI_EXTRA_SSIDS  space-separated SSIDs sharing the current Wi-Fi's
+#                     password (e.g. a 5 GHz band); preferred when in range.
 #
 # Functions run in this order on a full pass (grouped to match the three
 # concerns asked for — dependencies, code, permissions/cron — while
 # actually respecting the real dependency order: e.g. the pi-config-ui
 # user must exist before its venv can be created):
-#   bootstrap_system -> provision_tls_cert -> deploy_code ->
-#   install_dependencies -> configure_sso -> install_units ->
-#   install_wifi_recovery -> set_permissions -> setup_cron ->
-#   restart_services -> verify_deployment
+#   preflight -> bootstrap_system -> provision_tls_cert -> deploy_code ->
+#   install_dependencies -> migrate_to_networkmanager -> configure_wifi ->
+#   configure_sso -> install_units -> install_wifi_recovery ->
+#   set_permissions -> setup_cron -> register_dns -> restart_services ->
+#   verify_deployment
 #
 # --only runs a single function in isolation and assumes prior functions'
 # state already exists (e.g. --only setup_cron needs deploy_code to have
 # already staged deploy/maintenance.sh onto the Pi at least once).
+#
+# Supported targets: any Pi Zero-class board on a Debian-based OS, e.g.
+# Raspberry Pi OS (armhf/arm64) or Armbian (Walnut Pi Zero W, arm64).
+# PI_HOST's user needs passwordless sudo; on Armbian use root@<ip> with
+# an SSH key, since its first user is created without NOPASSWD sudo.
 
 set -euo pipefail
 
-PI_HOST="${PI_HOST:-mkesharw@192.168.1.19}"
-CERT_CN="${CERT_CN:-vpn.bpl.keekar.au}"
+PI_HOST="${PI_HOST:-}"
+CERT_CN="${CERT_CN:-}"
+DDNS_RECORD_NAME="${DDNS_RECORD_NAME:-}"
+ADMIN_RECORD_TARGET="${ADMIN_RECORD_TARGET:-}"
 ACME_EMAIL="${ACME_EMAIL:-}"
+CF_PASS_ENTRY="${CF_PASS_ENTRY-KeekarACI/Cloudflare}"
+WIFI_EXTRA_SSIDS="${WIFI_EXTRA_SSIDS:-}"
+# Pins host-key checks to the original address, so the run can continue
+# via <hostname>.local if the Wi-Fi handover changes the Pi's IP.
+HOST_KEY_ALIAS=""
+PI_HOSTNAME=""
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE_DIR="/tmp/pi-config-ui-deploy-$$"
 SKIP_DEPS=0
@@ -59,8 +86,88 @@ warn() { printf '\033[1;33m! %s\033[0m\n' "$1"; }
 # (<<'REMOTE') when the block needs no local variable substitution, or an
 # unquoted heredoc (<<REMOTE) when it does (escape any $ meant to be
 # evaluated remotely instead, e.g. \$(hostname)).
+pi_ssh() {
+  ssh -o "HostKeyAlias=$HOST_KEY_ALIAS" "$@"
+}
+
 remote() {
-  ssh "$PI_HOST" 'sudo bash -s'
+  pi_ssh "$PI_HOST" 'sudo bash -s'
+}
+
+# Like remote(), but first defines the named local variables (shell-quoted)
+# in the remote script, so a quoted heredoc can use them safely.
+remote_with() {
+  local v
+  { for v in "$@"; do printf '%s=%q\n' "$v" "${!v}"; done; cat; } | remote
+}
+
+# Prints the pass entry in acme.sh dns_cf / maintenance.sh format. The
+# token is account-owned, so acme.sh also needs CF_Account_ID.
+cf_token_env() {
+  pass show "$CF_PASS_ENTRY" 2>/dev/null \
+    | sed -n 's/^API_TOKEN=/CF_Token=/p; s/^Account_ID=/CF_Account_ID=/p'
+}
+
+preflight() {
+  log "Preflight checks"
+  local name_re='^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$' ssid_re='^[A-Za-z0-9_.-]+$' ssid
+  if [ -z "$PI_HOST" ]; then
+    warn "Set PI_HOST, e.g. PI_HOST=root@192.168.1.24 $0"
+    exit 1
+  fi
+  HOST_KEY_ALIAS="${PI_HOST#*@}"
+  if ! pi_ssh -o BatchMode=yes -o ConnectTimeout=10 "$PI_HOST" true; then
+    warn "Can't SSH to $PI_HOST with a key. Connect once with 'ssh $PI_HOST' (host key) and run 'ssh-copy-id $PI_HOST'."
+    exit 1
+  fi
+  if ! pi_ssh -o BatchMode=yes "$PI_HOST" 'sudo -n true' 2>/dev/null; then
+    warn "$PI_HOST has no passwordless sudo. On Armbian use PI_HOST=root@<ip>."
+    exit 1
+  fi
+
+  local saved saved_cn saved_ddns saved_admin
+  saved=$(pi_ssh "$PI_HOST" 'cat /etc/pi-config-ui/device.env 2>/dev/null' || true)
+  saved_cn=$(printf '%s\n' "$saved" | sed -n 's/^CERT_CN=//p')
+  saved_ddns=$(printf '%s\n' "$saved" | sed -n 's/^DDNS_RECORD_NAME=//p')
+  saved_admin=$(printf '%s\n' "$saved" | sed -n 's/^ADMIN_RECORD_TARGET=//p')
+  ADMIN_RECORD_TARGET="${ADMIN_RECORD_TARGET:-${saved_admin:-lan}}"
+  case "$ADMIN_RECORD_TARGET" in
+    lan|public) ;;
+    *) warn "ADMIN_RECORD_TARGET must be lan or public."; exit 1 ;;
+  esac
+  CERT_CN="${CERT_CN:-$saved_cn}"
+  if [ -z "$CERT_CN" ]; then
+    warn "First deploy to this device: give it its own hostname, e.g. CERT_CN=vpn2.bpl.keekar.au (never reuse another device's)."
+    exit 1
+  fi
+  if [ -z "$DDNS_RECORD_NAME" ]; then
+    if [ -n "$saved_ddns" ] && [ "$CERT_CN" = "$saved_cn" ]; then
+      DDNS_RECORD_NAME="$saved_ddns"
+    else
+      case "$CERT_CN" in
+        vpn*) DDNS_RECORD_NAME="wg${CERT_CN#vpn}" ;;
+        *) warn "Set DDNS_RECORD_NAME (WireGuard public hostname) for $CERT_CN."; exit 1 ;;
+      esac
+    fi
+  fi
+  if ! [[ "$CERT_CN" =~ $name_re && "$DDNS_RECORD_NAME" =~ $name_re ]]; then
+    warn "CERT_CN/DDNS_RECORD_NAME must be plain lowercase hostnames."
+    exit 1
+  fi
+  for ssid in $WIFI_EXTRA_SSIDS; do
+    [[ "$ssid" =~ $ssid_re ]] || { warn "Unsupported SSID '$ssid' (letters, digits, _ . - only)."; exit 1; }
+  done
+  if [ -n "$CF_PASS_ENTRY" ]; then
+    if ! command -v pass >/dev/null; then
+      warn "pass not installed — no Cloudflare token; the cert stays self-signed (set CF_PASS_ENTRY= to silence)."
+      CF_PASS_ENTRY=""
+    elif ! cf_token_env | grep -q '^CF_Token=.'; then
+      warn "pass entry '$CF_PASS_ENTRY' has no API_TOKEN= line (or pass is locked)."
+      exit 1
+    fi
+  fi
+  PI_HOSTNAME=$(pi_ssh "$PI_HOST" hostname)
+  echo "Device $PI_HOSTNAME: admin UI $CERT_CN (-> $ADMIN_RECORD_TARGET IP), WireGuard endpoint $DDNS_RECORD_NAME"
 }
 
 bootstrap_system() {
@@ -81,21 +188,26 @@ install -d -o pi-config-ui -g pi-config-ui -m 0755 /etc/pi-config-ui/monitor
 install -d -o root -g root -m 0755 /etc/pi-config-ui/monitor/pkg-backups
 REMOTE
 
-  # Cert generation needs $CERT_CN from the local side, so this block uses
-  # an unquoted heredoc — \$( ) below is escaped so it runs on the Pi, not
-  # on the Mac.
-  remote <<REMOTE
+  remote_with CERT_CN DDNS_RECORD_NAME ADMIN_RECORD_TARGET <<'REMOTE'
 set -euo pipefail
-if [ ! -f /etc/pi-config-ui/tls/cert.pem ]; then
-  echo "No existing TLS cert found — generating a self-signed one for ${CERT_CN}."
-  openssl req -x509 -newkey rsa:2048 -sha256 -days 825 -nodes \
-    -keyout /etc/pi-config-ui/tls/key.pem -out /etc/pi-config-ui/tls/cert.pem \
-    -subj "/CN=${CERT_CN}" \
-    -addext "subjectAltName=DNS:${CERT_CN},IP:\$(hostname -I | awk '{print \$1}')"
-  chown pi-config-ui:pi-config-ui /etc/pi-config-ui/tls/key.pem /etc/pi-config-ui/tls/cert.pem
+# Read by maintenance.sh ddns-update and by later deploys (see preflight).
+printf 'CERT_CN=%s\nDDNS_RECORD_NAME=%s\nADMIN_RECORD_TARGET=%s\n' "$CERT_CN" "$DDNS_RECORD_NAME" "$ADMIN_RECORD_TARGET" > /etc/pi-config-ui/device.env
+chmod 644 /etc/pi-config-ui/device.env
+CERT=/etc/pi-config-ui/tls/cert.pem
+self_signed() {
+  [ "$(openssl x509 -in "$CERT" -noout -issuer -nameopt RFC2253 | cut -d= -f2-)" = \
+    "$(openssl x509 -in "$CERT" -noout -subject -nameopt RFC2253 | cut -d= -f2-)" ]
+}
+if [ ! -f "$CERT" ] || { self_signed && ! openssl x509 -in "$CERT" -noout -checkhost "$CERT_CN" | grep -q 'does match'; }; then
+  echo "Generating a self-signed cert for $CERT_CN."
+  openssl req -x509 -newkey rsa:2048 -sha256 -days 825 -nodes -quiet \
+    -keyout /etc/pi-config-ui/tls/key.pem -out "$CERT" \
+    -subj "/CN=$CERT_CN" \
+    -addext "subjectAltName=DNS:$CERT_CN,IP:$(hostname -I | awk '{print $1}')"
+  chown pi-config-ui:pi-config-ui /etc/pi-config-ui/tls/key.pem "$CERT"
   chmod 600 /etc/pi-config-ui/tls/key.pem
 else
-  echo "Existing TLS cert found (\$(openssl x509 -in /etc/pi-config-ui/tls/cert.pem -noout -subject)) — leaving it untouched."
+  echo "Existing TLS cert found ($(openssl x509 -in "$CERT" -noout -subject)) — leaving it untouched."
 fi
 REMOTE
 }
@@ -103,12 +215,17 @@ REMOTE
 # Upgrades the self-signed cert from bootstrap_system to a real Let's
 # Encrypt one via acme.sh + Cloudflare DNS-01 (needed because keekar.au's
 # public A record for $CERT_CN points at this Pi's LAN IP, which rules out
-# HTTP-01 — see docs/RUNBOOK.md §5b). No-ops safely if the prerequisites
-# (the Cloudflare token, ACME_EMAIL) aren't there yet, or if a real cert
-# is already installed — this script never fabricates or stores the
-# Cloudflare token itself, same convention as configure_sso/sso.env.
+# HTTP-01 — see docs/RUNBOOK.md §5b). No-ops safely if the Cloudflare
+# token isn't available, or if a real cert for CERT_CN is already
+# installed. The token comes from `pass` (CF_PASS_ENTRY) and is piped
+# straight to the Pi — never on a command line, in output, or on disk here.
 provision_tls_cert() {
   log "Provisioning trusted TLS certificate (Let's Encrypt via Cloudflare DNS-01)"
+
+  if [ -n "$CF_PASS_ENTRY" ]; then
+    cf_token_env | pi_ssh "$PI_HOST" "sudo sh -c 'umask 077; cat > /root/.cf-dns-token'"
+    echo "Cloudflare token from pass '$CF_PASS_ENTRY' installed at /root/.cf-dns-token (mode 600)."
+  fi
 
   if ! remote <<'REMOTE'
 test -f /root/.cf-dns-token
@@ -119,56 +236,55 @@ REMOTE
     return 0
   fi
 
-  if remote <<'REMOTE'
+  if remote_with CERT_CN <<'REMOTE'
 set -euo pipefail
-test -f /etc/pi-config-ui/tls/cert.pem
-issuer=$(openssl x509 -in /etc/pi-config-ui/tls/cert.pem -noout -issuer)
-subject=$(openssl x509 -in /etc/pi-config-ui/tls/cert.pem -noout -subject)
-[ "$issuer" != "$subject" ]
+CERT=/etc/pi-config-ui/tls/cert.pem
+test -f "$CERT"
+# -nameopt + cut compare the DNs themselves; the raw "issuer="/"subject=" prefixes always differ.
+[ "$(openssl x509 -in "$CERT" -noout -issuer -nameopt RFC2253 | cut -d= -f2-)" != \
+  "$(openssl x509 -in "$CERT" -noout -subject -nameopt RFC2253 | cut -d= -f2-)" ]
+openssl x509 -in "$CERT" -noout -checkhost "$CERT_CN" | grep -q 'does match'
 REMOTE
   then
-    echo "Existing cert is already CA-issued — leaving it untouched."
+    echo "Existing cert is already CA-issued for $CERT_CN — leaving it untouched."
     return 0
   fi
 
-  if [ -z "$ACME_EMAIL" ]; then
-    warn "ACME_EMAIL not set — skipping cert issuance (self-signed cert stays in place)."
-    warn "Re-run: ACME_EMAIL=you@example.com ./deploy/deploy.sh --only provision_tls_cert"
-    return 0
-  fi
-
-  remote <<'REMOTE'
+  remote_with ACME_EMAIL <<'REMOTE'
 set -euo pipefail
 if [ ! -d /root/.acme.sh ]; then
-  curl -s https://get.acme.sh | sh -s email=acme-bootstrap@invalid
+  curl -s https://get.acme.sh | sh -s ${ACME_EMAIL:+email="$ACME_EMAIL"}
 fi
+# Older deploys installed with a placeholder address Let's Encrypt rejects.
+sed -i "/^ACCOUNT_EMAIL='\?acme-bootstrap@invalid/d" /root/.acme.sh/account.conf 2>/dev/null || true
 REMOTE
 
-  # Needs $ACME_EMAIL/$CERT_CN from the local side, so this block uses an
-  # unquoted heredoc (no $ needing remote-side escaping here — the whole
-  # block already runs as one root bash script per the remote() helper, so
-  # sourcing the token file at the top just exports CF_Token for every
-  # command below it, no nested sh -c needed).
-  remote <<REMOTE
+  remote_with ACME_EMAIL CERT_CN <<'REMOTE'
 set -euo pipefail
 set -a
 . /root/.cf-dns-token
 set +a
-/root/.acme.sh/acme.sh --register-account -m "${ACME_EMAIL}" --server letsencrypt
+/root/.acme.sh/acme.sh --register-account ${ACME_EMAIL:+-m "$ACME_EMAIL"} --server letsencrypt
 /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-/root/.acme.sh/acme.sh --issue --dns dns_cf -d ${CERT_CN} --server letsencrypt
-/root/.acme.sh/acme.sh --install-cert -d ${CERT_CN} --ecc --key-file /etc/pi-config-ui/tls/key.pem --fullchain-file /etc/pi-config-ui/tls/cert.pem --reloadcmd "chown pi-config-ui:pi-config-ui /etc/pi-config-ui/tls/key.pem /etc/pi-config-ui/tls/cert.pem && chmod 600 /etc/pi-config-ui/tls/key.pem && chmod 644 /etc/pi-config-ui/tls/cert.pem && systemctl restart pi-config-ui"
+# Exit code 2 means "already issued and not due for renewal".
+# --dnssleep: the LAN resolver blocks DoH (cloudflare-dns.com -> 0.0.0.0),
+# so acme.sh's own propagation check never succeeds; wait a fixed time instead.
+rc=0
+/root/.acme.sh/acme.sh --issue --dns dns_cf --dnssleep 60 -d "$CERT_CN" --server letsencrypt || rc=$?
+[ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]
+# try-restart: on a first deploy the unit isn't installed yet.
+/root/.acme.sh/acme.sh --install-cert -d "$CERT_CN" --ecc --key-file /etc/pi-config-ui/tls/key.pem --fullchain-file /etc/pi-config-ui/tls/cert.pem --reloadcmd "chown pi-config-ui:pi-config-ui /etc/pi-config-ui/tls/key.pem /etc/pi-config-ui/tls/cert.pem && chmod 600 /etc/pi-config-ui/tls/key.pem && chmod 644 /etc/pi-config-ui/tls/cert.pem && (systemctl try-restart pi-config-ui || true)"
 REMOTE
 }
 
 deploy_code() {
   log "Deploying application code"
-  ssh "$PI_HOST" "mkdir -p '$STAGE_DIR/app' '$STAGE_DIR/deploy'"
-  rsync -az --delete --exclude '__pycache__' --exclude '*.pyc' \
+  pi_ssh "$PI_HOST" "mkdir -p '$STAGE_DIR/app' '$STAGE_DIR/deploy'"
+  rsync -az -e "ssh -o HostKeyAlias=$HOST_KEY_ALIAS" --delete --exclude '__pycache__' --exclude '*.pyc' \
     "$REPO_ROOT/app/" "$PI_HOST:$STAGE_DIR/app/"
-  rsync -az --exclude 'sso.env' \
+  rsync -az -e "ssh -o HostKeyAlias=$HOST_KEY_ALIAS" --exclude 'sso.env' \
     "$REPO_ROOT/deploy/" "$PI_HOST:$STAGE_DIR/deploy/"
-  scp -q "$REPO_ROOT/requirements.txt" "$PI_HOST:$STAGE_DIR/requirements.txt"
+  scp -q -o "HostKeyAlias=$HOST_KEY_ALIAS" "$REPO_ROOT/requirements.txt" "$PI_HOST:$STAGE_DIR/requirements.txt"
 
   remote <<REMOTE
 set -euo pipefail
@@ -199,6 +315,7 @@ set -euo pipefail
 # observed as unreachable over IPv6 — force apt to stick to IPv4 so a
 # transient IPv6 routing issue can't stall/fail package operations.
 APT_OPTS=(-o Acquire::ForceIPv4=true)
+export DEBIAN_FRONTEND=noninteractive
 apt-get "${APT_OPTS[@]}" update -qq
 # python3-venv/iptables/wireguard*: needed by the app and WireGuard tab.
 # python3: python3-venv pulls this in transitively on Debian, but ensured
@@ -225,29 +342,225 @@ apt-get "${APT_OPTS[@]}" update -qq
 # iproute2: app/routing.py (pyroute2) and this project's own scripts all
 # assume `ip`/`ss` exist — virtually always preinstalled, but a full
 # bootstrap shouldn't silently assume it.
-apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
-  python3 python3-venv wireguard wireguard-tools iptables \
-  resolvconf network-manager dnsutils \
-  rsync curl cron openssl iproute2
+# Board-agnostic choices (Raspberry Pi OS and Armbian alike):
+# - wireguard-tools, not the `wireguard` metapackage: on Armbian the
+#   metapackage pulls a stock Debian kernel that can replace the board's.
+# - bind9-dnsutils: plain `dnsutils` has no candidate on Debian trixie.
+# - resolvconf only without systemd-resolved: they conflict, and apt
+#   would remove the resolver the board is currently using.
+# - polkitd/wpasupplicant: preinstalled on Raspberry Pi OS, absent on
+#   Armbian minimal; --no-install-recommends would otherwise skip them.
+# avahi-daemon: <hostname>.local keeps the Pi reachable if its IP changes.
+PKGS=(python3 python3-venv wireguard-tools iptables network-manager
+  wpasupplicant bind9-dnsutils whiptail rsync curl cron openssl iproute2
+  avahi-daemon)
+if apt-cache show polkitd >/dev/null 2>&1; then PKGS+=(polkitd); else PKGS+=(policykit-1); fi
+systemctl is-active --quiet systemd-resolved || PKGS+=(resolvconf)
+
+# On a systemd-networkd board (Armbian), NetworkManager's postinst starts
+# it immediately; keep it hands-off every interface until
+# migrate_to_networkmanager hands Wi-Fi over with a rollback guard.
+if systemctl is-active --quiet systemd-networkd && ! systemctl is-active --quiet NetworkManager; then
+  install -d /etc/NetworkManager/conf.d
+  printf '[keyfile]\nunmanaged-devices=*\n' > /etc/NetworkManager/conf.d/99-pi-config-ui-hold.conf
+fi
+apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "${PKGS[@]}"
+
+if ! modprobe wireguard 2>/dev/null && [ ! -d /sys/module/wireguard ]; then
+  echo "ERROR: this kernel has no WireGuard support (needs Linux >= 5.6 or the module)." >&2
+  exit 1
+fi
+
 if [ ! -d /opt/pi-config-ui/venv ]; then
   sudo -u pi-config-ui python3 -m venv /opt/pi-config-ui/venv
 fi
-sudo -u pi-config-ui /opt/pi-config-ui/venv/bin/pip install -q \
-  --index-url https://www.piwheels.org/simple \
-  -r /opt/pi-config-ui/requirements.txt
+# piwheels only builds 32-bit ARM wheels; arm64 boards get prebuilt
+# aarch64 wheels from PyPI directly.
+PIP_INDEX=()
+case "$(dpkg --print-architecture)" in
+  armhf|armel) PIP_INDEX=(--index-url https://www.piwheels.org/simple) ;;
+esac
+sudo -u pi-config-ui env PIP_NO_CACHE_DIR=1 /opt/pi-config-ui/venv/bin/pip install -q \
+  "${PIP_INDEX[@]}" -r /opt/pi-config-ui/requirements.txt
+REMOTE
+}
+
+# The Network tab (app/network.py) and Wi-Fi recovery drive nmcli, so
+# NetworkManager must own Wi-Fi. Raspberry Pi OS already does this; Armbian
+# ships netplan + systemd-networkd instead. The switch runs detached on the
+# Pi (this SSH session drops with Wi-Fi) and reverts itself unless
+# NetworkManager brings a connection with a default route up within ~90s.
+migrate_to_networkmanager() {
+  log "Ensuring NetworkManager manages networking"
+  local state
+  state=$(remote <<'REMOTE'
+set -euo pipefail
+HOLD=/etc/NetworkManager/conf.d/99-pi-config-ui-hold.conf
+# networkd stays running after a successful migration until the next reboot.
+if ! systemctl is-active --quiet systemd-networkd || [ -f /etc/netplan/90-pi-config-ui-networkmanager.yaml ]; then
+  rm -f "$HOLD"
+  echo done
+  exit 0
+fi
+if ! command -v netplan >/dev/null; then
+  echo no-netplan
+  exit 0
+fi
+rm -f /run/pi-config-ui-nm-migrate.result
+cat > /run/pi-config-ui-nm-migrate.sh <<'MIGRATE'
+#!/bin/bash
+set -u
+HOLD=/etc/NetworkManager/conf.d/99-pi-config-ui-hold.conf
+OVERRIDE=/etc/netplan/90-pi-config-ui-networkmanager.yaml
+RESULT=/run/pi-config-ui-nm-migrate.result
+online() {
+  nmcli -t -f STATE device 2>/dev/null | grep -qx connected && ip -4 route show default | grep -q .
+}
+printf 'network:\n  version: 2\n  renderer: NetworkManager\n' > "$OVERRIDE"
+chmod 600 "$OVERRIDE"
+rm -f "$HOLD"
+netplan generate
+# netplan apply leaves netplan-wpa-wlan0 holding the radio, so NM's
+# wpa_supplicant "couldn't grab this interface"; release it explicitly.
+systemctl stop 'netplan-wpa-*.service' systemd-networkd.socket systemd-networkd.service
+# netplan's udev rule tagged wlan0 NM_UNMANAGED at boot; re-evaluate with the regenerated rules.
+udevadm control --reload
+udevadm trigger --action=change --subsystem-match=net
+udevadm settle
+systemctl enable NetworkManager NetworkManager-wait-online
+systemctl restart NetworkManager
+for _ in $(seq 1 45); do
+  if online; then
+    # networkd now manages nothing; its wait-online would stall every boot.
+    systemctl disable systemd-networkd.service systemd-networkd.socket systemd-networkd-wait-online.service
+    echo ok > "$RESULT"
+    exit 0
+  fi
+  sleep 2
+done
+rm -f "$OVERRIDE"
+printf '[keyfile]\nunmanaged-devices=*\n' > "$HOLD"
+systemctl restart NetworkManager
+netplan generate
+systemctl start systemd-networkd.socket systemd-networkd.service
+netplan apply
+echo rolled-back > "$RESULT"
+MIGRATE
+systemd-run --quiet --unit=pi-config-ui-nm-migrate --collect /bin/bash /run/pi-config-ui-nm-migrate.sh
+echo started
+REMOTE
+)
+
+  case "$state" in
+    done) echo "NetworkManager already manages networking."; return 0 ;;
+    no-netplan)
+      warn "systemd-networkd is active but netplan is missing — switch networking to NetworkManager manually (nmtui), then re-run."
+      exit 1 ;;
+  esac
+
+  warn "Handing Wi-Fi to NetworkManager; SSH will drop briefly (auto-rollback after ~90s if it fails)."
+  warn "NetworkManager's DHCP client ID differs from networkd's, so the Pi may get a new IP — a DHCP reservation avoids this."
+  local result="" host user_prefix=""
+  case "$PI_HOST" in *@*) user_prefix="${PI_HOST%%@*}@" ;; esac
+  for _ in $(seq 1 36); do
+    sleep 5
+    for host in "$PI_HOST" "${user_prefix}${PI_HOSTNAME}.local"; do
+      result=$(pi_ssh -o ConnectTimeout=5 -o BatchMode=yes "$host" \
+        'cat /run/pi-config-ui-nm-migrate.result 2>/dev/null' 2>/dev/null || true)
+      [ -n "$result" ] && break
+    done
+    case "$result" in
+      ok)
+        echo "NetworkManager now manages networking."
+        if [ "$host" != "$PI_HOST" ]; then
+          warn "The Pi's IP changed; continuing via $host (use PI_HOST=$host next time)."
+          PI_HOST="$host"
+        fi
+        return 0 ;;
+      rolled-back)
+        warn "NetworkManager didn't come online; the Pi rolled back to systemd-networkd. Check: journalctl -u NetworkManager"
+        exit 1 ;;
+    esac
+  done
+  warn "Couldn't reach $PI_HOST after the switch. It may have a new IP: check your router, then re-run with PI_HOST=user@<new-ip>."
+  exit 1
+}
+
+# Extra SSIDs reuse the active Wi-Fi's password, read on the Pi itself so it
+# never crosses SSH or lands in this terminal.
+configure_wifi() {
+  [ -n "$WIFI_EXTRA_SSIDS" ] || return 0
+  log "Adding Wi-Fi networks: $WIFI_EXTRA_SSIDS"
+  remote_with WIFI_EXTRA_SSIDS <<'REMOTE'
+set -euo pipefail
+active=$(nmcli -t -f NAME,TYPE connection show --active | awk -F: '$2=="802-11-wireless"{print $1; exit}')
+[ -n "$active" ] || { echo "No active Wi-Fi connection to copy the password from." >&2; exit 1; }
+for ssid in $WIFI_EXTRA_SSIDS; do
+  if nmcli -t -f NAME connection show | grep -qxF "$ssid" \
+    || [ "$(nmcli -g 802-11-wireless.ssid connection show "$active")" = "$ssid" ]; then
+    echo "$ssid already configured."
+    continue
+  fi
+  psk=$(nmcli -s -g 802-11-wireless-security.psk connection show "$active")
+  [ -n "$psk" ] || { echo "Active Wi-Fi '$active' has no PSK to reuse." >&2; exit 1; }
+  file="/etc/NetworkManager/system-connections/$ssid.nmconnection"
+  (umask 077; cat > "$file" <<EOF
+[connection]
+id=$ssid
+uuid=$(cat /proc/sys/kernel/random/uuid)
+type=wifi
+interface-name=wlan0
+autoconnect-priority=10
+
+[wifi]
+mode=infrastructure
+ssid=$ssid
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=$psk
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+EOF
+  )
+  echo "$ssid added (preferred when in range; takes effect on the next reconnect)."
+done
+nmcli connection reload
 REMOTE
 }
 
 configure_sso() {
   log "Checking SSO configuration"
+  if ! remote <<'REMOTE' && [ -f "$REPO_ROOT/deploy/sso.env" ]
+test -f /etc/pi-config-ui/sso.env
+REMOTE
+  then
+    # Same OIDC client for every device; only the redirect host differs (fixed below).
+    pi_ssh "$PI_HOST" "sudo sh -c 'umask 077; cat > /etc/pi-config-ui/sso.env'" < "$REPO_ROOT/deploy/sso.env"
+    echo "Copied local deploy/sso.env to the Pi."
+  fi
   if remote <<'REMOTE'
 test -f /etc/pi-config-ui/sso.env
 REMOTE
   then
-    echo "sso.env already present — leaving it untouched."
+    remote_with CERT_CN <<'REMOTE'
+set -euo pipefail
+F=/etc/pi-config-ui/sso.env
+want="SSO_REDIRECT_URI=https://$CERT_CN/auth/callback"
+if ! grep -qxF "$want" "$F"; then
+  sed -i "s#^SSO_REDIRECT_URI=.*#$want#" "$F"
+  echo "SSO redirect set to https://$CERT_CN/auth/callback — add it to the Authentik provider's redirect URIs."
+fi
+chown pi-config-ui:pi-config-ui "$F"
+chmod 600 "$F"
+REMOTE
   else
     warn "No /etc/pi-config-ui/sso.env found — installing the placeholder template."
-    scp -q "$REPO_ROOT/deploy/sso.env.example" "$PI_HOST:/tmp/sso.env.staged-$$"
+    scp -q -o "HostKeyAlias=$HOST_KEY_ALIAS" "$REPO_ROOT/deploy/sso.env.example" "$PI_HOST:/tmp/sso.env.staged-$$"
     remote <<REMOTE
 set -euo pipefail
 mv "/tmp/sso.env.staged-$$" /etc/pi-config-ui/sso.env
@@ -334,6 +647,7 @@ cat > /etc/cron.d/pi-config-ui-maintenance <<'CRON'
 # Managed by deploy/deploy.sh — edits here are overwritten on next deploy.
 2,12,22,32,42,52 * * * * root /opt/pi-config-ui/maintenance.sh health >> /var/log/pi-config-ui-maintenance.log 2>&1
 7,17,27,37,47,57 * * * * root /opt/pi-config-ui/maintenance.sh ddns-update >> /var/log/pi-config-ui-maintenance.log 2>&1
+4,14,24,34,44,54 * * * * root /opt/pi-config-ui/maintenance.sh wg-guard >> /var/log/pi-config-ui-maintenance.log 2>&1
 0 3 * * * root /opt/pi-config-ui/maintenance.sh cert-renew >> /var/log/pi-config-ui-maintenance.log 2>&1
 0 4 * * 0 root /opt/pi-config-ui/maintenance.sh cleanup >> /var/log/pi-config-ui-maintenance.log 2>&1
 0 5 * * 3 root /opt/pi-config-ui/maintenance.sh os-update >> /var/log/pi-config-ui-maintenance.log 2>&1
@@ -342,7 +656,17 @@ CRON
 chmod 644 /etc/cron.d/pi-config-ui-maintenance
 touch /var/log/pi-config-ui-maintenance.log
 
-# Never rotated otherwise: six cron jobs above (two every 10 minutes)
+# Boot is when an overlapping client tunnel locks the Pi out, so guard right
+# after every wg-quick start, not just on the cron backstop. "-" = never fail the start.
+install -d /etc/systemd/system/wg-quick@.service.d
+cat > /etc/systemd/system/wg-quick@.service.d/pi-config-ui-guard.conf <<'UNIT'
+# Managed by deploy/deploy.sh — see maintenance.sh cmd_wg_guard.
+[Service]
+ExecStartPost=-/opt/pi-config-ui/maintenance.sh wg-guard
+UNIT
+systemctl daemon-reload
+
+# Never rotated otherwise: seven cron jobs above (three every 10 minutes)
 # append to this file forever. logrotate itself is already installed and
 # run daily by the OS (Raspbian default) — this just gives it a target.
 cat > /etc/logrotate.d/pi-config-ui-maintenance <<'LOGROTATE'
@@ -355,6 +679,15 @@ cat > /etc/logrotate.d/pi-config-ui-maintenance <<'LOGROTATE'
   create 644 root root
 }
 LOGROTATE
+REMOTE
+}
+
+# Creates/updates only this device's own records (from device.env).
+register_dns() {
+  log "Registering DNS records in Cloudflare"
+  remote <<'REMOTE'
+set -euo pipefail
+/opt/pi-config-ui/maintenance.sh ddns-update
 REMOTE
 }
 
@@ -403,10 +736,26 @@ PORT="${PORT:-443}"
 echo "-- root endpoint (expect 303) --"
 curl -sk -o /dev/null -w "%{http_code}\n" "https://localhost:${PORT}/"
 echo "-- login cookie attributes (expect samesite=lax, secure, httponly) --"
-curl -sk -D - -o /dev/null "https://localhost:${PORT}/auth/login" | grep -i set-cookie || true
+COOKIE_HEADER=$(curl -sk -D - -o /dev/null "https://localhost:${PORT}/auth/login" \
+  | awk 'tolower($1) == "set-cookie:" {sub(/\r$/, ""); print; exit}')
+if [ -z "$COOKIE_HEADER" ]; then
+  echo "set-cookie header: missing"
+else
+  COOKIE_HEADER_LOWER=${COOKIE_HEADER,,}
+  for attribute in "samesite=lax" "secure" "httponly"; do
+    if [[ "$COOKIE_HEADER_LOWER" == *"$attribute"* ]]; then
+      echo "$attribute=yes"
+    else
+      echo "$attribute=no"
+    fi
+  done
+fi
 echo "-- Syd-Home client tunnel state (must be UNCHANGED by this script) --"
 systemctl is-enabled wg-quick@Syd-Home 2>/dev/null || echo "not present"
 systemctl is-active wg-quick@Syd-Home 2>/dev/null || echo "not active"
+echo "-- WireGuard client overlap guard (no WARNING = no overlap with the local LAN) --"
+/opt/pi-config-ui/maintenance.sh wg-guard
+wg show all allowed-ips 2>/dev/null || true
 echo "-- TLS cert in use --"
 openssl x509 -in /etc/pi-config-ui/tls/cert.pem -noout -issuer -enddate
 echo "-- Cloudflare DDNS token present? (needed by maintenance.sh ddns-update, see docs/RUNBOOK.md §5c) --"
@@ -425,6 +774,7 @@ main() {
     shift
   done
 
+  preflight
   if [ -n "$ONLY" ]; then
     "$ONLY"
   else
@@ -432,11 +782,14 @@ main() {
     provision_tls_cert
     deploy_code
     install_dependencies
+    migrate_to_networkmanager
+    configure_wifi
     configure_sso
     install_units
     install_wifi_recovery
     set_permissions
     setup_cron
+    register_dns
     restart_services
     verify_deployment
   fi

@@ -25,13 +25,19 @@ pre-existing TLS cert or `sso.env`, and — critically — never
 enables/starts/restarts a WireGuard *client*-role tunnel like `Syd-Home`,
 per the safety note in §9.4):
 ```bash
-PI_HOST=user@host ./deploy/deploy.sh          # full bootstrap + update
+PI_HOST=user@host CERT_CN=vpn2.bpl.keekar.au ./deploy/deploy.sh   # first deploy of a device
+PI_HOST=user@host ./deploy/deploy.sh          # later runs (names read from the device)
 ./deploy/deploy.sh --skip-deps                 # faster iteration, skip apt/pip
 ./deploy/deploy.sh --only <function_name>      # run a single step
 ```
+`PI_HOST` is required. Each device gets its own names on the first deploy
+(`CERT_CN`, `DDNS_RECORD_NAME`, `ADMIN_RECORD_TARGET`), saved in
+`/etc/pi-config-ui/device.env`, so two devices can never overwrite each
+other's DNS records. `preflight` checks SSH key login and passwordless
+sudo before anything changes (on Armbian use `root@<ip>`).
 It also runs `provision_tls_cert` (upgrades the self-signed cert to a real
-Let's Encrypt one via DNS-01 once `ACME_EMAIL` and a Cloudflare token are
-in place — see §5b) and installs `deploy/maintenance.sh` via a cron.d
+Let's Encrypt one via DNS-01 using the Cloudflare token from
+`pass show KeekarACI/Cloudflare` — see §5b) and installs `deploy/maintenance.sh` via a cron.d
 drop-in (`/etc/cron.d/pi-config-ui-maintenance`) covering
 health-check-and-restart (every 10 min — including restarting any
 `SERVER_TUNNELS`-listed WireGuard server tunnel found enabled-but-inactive;
@@ -50,7 +56,7 @@ restarts/best-effort-rolls-back and alerts if something's broken; also
 see §5e for the related "how long was this device down" dashboard
 feature) and drops a `logrotate` config for the maintenance cron jobs' own
 log file (`/var/log/pi-config-ui-maintenance.log`) — nothing else rotates
-a plain file that six jobs append to forever — see the scripts themselves
+a plain file that seven jobs append to forever — see the scripts themselves
 for the exact behavior. The manual steps below are what the script
 encodes; use them for a first-time understanding of the system or if you
 need to do something the script doesn't cover.
@@ -65,6 +71,20 @@ the real device is stronger, everything here still applies, just with more
 headroom. OS is `Raspbian GNU/Linux 13 (trixie)` — nftables-native, no
 `iptables` binary by default (§7 below), NetworkManager-managed networking
 (not `dhcpcd`).
+
+**Also supported since 1.0.2: Walnut Pi Zero W on Armbian** (Debian 13,
+`arm64`, Allwinner H618, ~1GB RAM, 2.4/5 GHz Wi-Fi, WireGuard built into
+the kernel). Differences `deploy.sh` handles automatically:
+- Networking ships as netplan + systemd-networkd; `migrate_to_networkmanager`
+  hands Wi-Fi to NetworkManager (detached on the Pi, with a ~90 s
+  auto-rollback). NetworkManager's DHCP client ID differs, so the IP may
+  change once — the deploy continues via `<hostname>.local`, and a DHCP
+  reservation avoids it.
+- The first user has no passwordless sudo: deploy as `root@<ip>` with a key.
+- Install only `wireguard-tools` (the `wireguard` metapackage pulls a stock
+  Debian kernel over the board's), and no `resolvconf` (it would remove
+  `systemd-resolved`).
+- Python wheels come from PyPI (aarch64), not piwheels (§2).
 
 ## 1. Base OS network sanity (do this before anything else)
 
@@ -239,10 +259,13 @@ sudo -u pi-config-ui /opt/pi-config-ui/venv/bin/pip install \
   --index-url https://www.piwheels.org/simple \
   -r /opt/pi-config-ui/requirements.txt
 ```
-**Use piwheels, not plain PyPI**: `psutil`, `pyroute2`, and `cryptography`
+**Use piwheels, not plain PyPI**, on 32-bit Raspberry Pi OS (`armhf`):
+`psutil`, `pyroute2`, and `cryptography`
 (an authlib transitive dep) have C extensions with no upstream `armv6l`
 wheels on PyPI — without piwheels, pip compiles from source, slow on a
-1GHz single core. With piwheels this completes in a few minutes.
+1GHz single core. With piwheels this completes in a few minutes. On arm64
+(Walnut Pi / Armbian) it's the reverse: piwheels has no aarch64 wheels,
+and PyPI has them for every pinned package — drop `--index-url`.
 
 ## 3. TLS certificate trust for the SSO/IdP connection
 
@@ -331,10 +354,8 @@ needs to be reachable from outside the LAN.
 
 Only needed if the app's hostname needs to be trusted by a real browser
 (no "not secure" warning) rather than just reachable on the LAN.
-`deploy.sh`'s `provision_tls_cert` automates everything below except step
-1 (secrets are never handled by the script — same convention as
-`sso.env`), and is safe to re-run: it detects an already-CA-issued cert and
-leaves it untouched.
+`deploy.sh`'s `provision_tls_cert` automates all of this, and is safe to
+re-run: it leaves a CA-issued cert that already covers `CERT_CN` untouched.
 
 **Why acme.sh (not certbot), and why DNS-01 (not HTTP-01):**
 - `acme.sh` is a pure shell script with no Python/venv overhead — a
@@ -348,23 +369,25 @@ leaves it untouched.
   it doesn't care what the A record resolves to.
 
 **Steps:**
-1. In the Cloudflare dashboard (the DNS host for this project's zone): My
-   Profile → API Tokens → Create Token → "Edit zone DNS" template,
-   restricted to this specific zone only (least privilege — not the
-   account-wide Global API Key). SSH into the Pi yourself and store it
-   where `provision_tls_cert` expects it:
+1. In the Cloudflare dashboard: create an API token with **Zone → DNS →
+   Edit** on this zone only (least privilege — not the Global API Key) and
+   store it in `pass` on your Mac as `KeekarACI/Cloudflare`, with lines
+   `API_TOKEN=<token>` and `Account_ID=<id>` (account-owned tokens need
+   the account ID). `deploy.sh` pipes it to `/root/.cf-dns-token` (mode
+   600) as `CF_Token`/`CF_Account_ID` — never on a command line or in
+   output. Use `CF_PASS_ENTRY=<entry>` for a different entry, or
+   `CF_PASS_ENTRY=` to skip.
+2. Run the deploy script (`ACME_EMAIL` is optional):
    ```bash
-   sudo sh -c 'umask 077; printf "CF_Token=%s\n" "<paste-token>" > /root/.cf-dns-token'
-   ```
-2. Run the deploy script with an email for the Let's Encrypt account
-   (used only for expiry-related notices):
-   ```bash
-   ACME_EMAIL=you@example.com ./deploy/deploy.sh --only provision_tls_cert
+   ./deploy/deploy.sh --only provision_tls_cert
    ```
    Or, for a full deploy pass that also provisions the cert:
    ```bash
-   ACME_EMAIL=you@example.com ./deploy/deploy.sh
+   ./deploy/deploy.sh
    ```
+   Issuance uses `--dnssleep 60`: this LAN's resolver blocks
+   DNS-over-HTTPS (`cloudflare-dns.com` → `0.0.0.0`), so acme.sh's own
+   propagation check would otherwise wait forever.
 3. This installs `acme.sh` under root, registers a Let's Encrypt account,
    issues the cert via `--dns dns_cf`, and installs it to
    `/etc/pi-config-ui/tls/{key,cert}.pem` with a `--reloadcmd` that fixes
@@ -390,11 +413,14 @@ echo | openssl s_client -connect <hostname>:443 -servername <hostname> 2>/dev/nu
 Only relevant once a WireGuard server-role tunnel (§10, e.g. `Bpl-Home`)
 needs to accept peers connecting from *outside* the LAN, and this device's
 public IP isn't static. Deliberately a **separate hostname** from
-`CERT_CN`/`vpn.bpl.keekar.au` above — that one intentionally resolves to
-this Pi's private LAN IP (§5b), kept off the public internet as a
+`CERT_CN` (the admin UI, e.g. `vpn2.bpl.keekar.au`) — that one resolves to
+the Pi's private LAN IP by default (§5b), kept off the public internet as a
 deliberate hardening choice for the admin UI. This section's hostname
-(`wg.bpl.keekar.au` in this deployment) is the opposite: it's meant to be
-publicly resolvable to whatever this device's real WAN IP currently is.
+(`DDNS_RECORD_NAME`, e.g. `wg2.bpl.keekar.au`) is the opposite: it's meant
+to be publicly resolvable to whatever this device's real WAN IP currently
+is. For a device at a remote site whose LAN you can't reach (e.g. Bhopal),
+deploy once with `ADMIN_RECORD_TARGET=public` so `CERT_CN` also resolves
+to the site's public IPv4.
 
 `deploy/maintenance.sh`'s `cmd_ddns_update` (cron, every 10 minutes, see
 `setup_cron` below) keeps that record current automatically using the same
@@ -403,38 +429,34 @@ Cloudflare API token already provisioned for §5b
 existing "Edit zone DNS" scope rather than requesting a broader token,
 per this project's least-privilege convention.
 
-**One-time manual step, not automated by this script or `deploy.sh`**:
-the DNS record must already exist before `ddns-update` will touch it — by
-design, it only ever `PATCH`es an existing record, never creates one (a
-safety choice: a typo'd hostname in `DDNS_RECORD_NAME` should fail loudly
-rather than silently create an unexpected record in the zone). Create it
-once, from the Pi (reuses the same token file, avoids copying the token
-anywhere else):
-```bash
-sudo bash -c '
-set -a; . /root/.cf-dns-token; set +a
-ZONE_ID=<this zone'"'"'s ID — GET https://api.cloudflare.com/client/v4/zones?name=<your zone> with the same token>
-CURRENT_IP=$(curl -s https://ifconfig.me)
-curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
-  -H "Authorization: Bearer $CF_Token" -H "Content-Type: application/json" \
-  --data "{\"type\":\"A\",\"name\":\"<your DDNS_RECORD_NAME>\",\"content\":\"${CURRENT_IP}\",\"ttl\":300,\"proxied\":false}"
-'
-```
-`"proxied":false` (DNS-only/grey-cloud) is required, not optional —
+**Per-device names, created automatically (since 1.0.2)**: the names come
+only from this device's `/etc/pi-config-ui/device.env`, written by
+`deploy.sh` (`CERT_CN`, `DDNS_RECORD_NAME`, `ADMIN_RECORD_TARGET`) —
+nothing is hardcoded in `maintenance.sh`, so one device can never
+overwrite another's records. Missing records are created (needed because
+other DNS may otherwise answer for a new name); `deploy.sh`'s
+`register_dns` runs the first update immediately. Each run:
+- `DDNS_RECORD_NAME` `A` → public IPv4 (`curl -4 ifconfig.me`; without
+  `-4`, dual-stack links answer with IPv6 and nothing was published).
+- `DDNS_RECORD_NAME` `AAAA` → the interface's stable global IPv6
+  (temporary/privacy and ULA addresses skipped); deleted if the device
+  moves to a network without IPv6, so peers never dial a dead address.
+- `CERT_CN` `A` → LAN IP, or the public IPv4 with `ADMIN_RECORD_TARGET=public`.
+
+All records are created DNS-only.
 Cloudflare's proxy only fronts HTTP(S)-shaped traffic; WireGuard is raw
 UDP and would simply never arrive if proxied.
 
-Update `CF_ZONE_ID`/`DDNS_RECORD_NAME` at the top of `deploy/maintenance.sh`
-to match your own zone/hostname before deploying to a new zone/domain.
+Update `CF_ZONE_ID` at the top of `deploy/maintenance.sh` before deploying
+to a new zone/domain.
 
 **Verify:**
 ```bash
 sudo /opt/pi-config-ui/maintenance.sh ddns-update   # manual run; no output = already correct
 tail -f /var/log/pi-config-ui-maintenance.log        # watch for the next scheduled run
 ```
-If the record doesn't exist yet, this logs `ERROR: ddns-update: no DNS
-record found for <name>` every 10 minutes (harmless, but noisy) until the
-one-time creation step above is done.
+If `device.env` or the token is missing, each run logs a one-line skip
+notice instead — redeploy with `CERT_CN` set to fix.
 
 Still required regardless of DNS being correct: a router-level port
 forward (this tunnel's `ListenPort`/udp → this Pi's LAN IP) at whatever
@@ -757,6 +779,15 @@ server elsewhere). **Not** the same as the WireGuard tab's server feature
      **does not** remove the stale kernel route `wg-quick` already added
      — also run `sudo ip route del <subnet> dev <name>`, then rewrite the
      `.conf` file so the fix survives a restart.
+   - **Automatic guard (since 1.0.2)**: `maintenance.sh wg-guard` does
+     exactly that live trim for every client tunnel (one whose `.conf` has
+     an `Endpoint`; server tunnels are never touched). It runs right after
+     every `wg-quick` start (drop-in
+     `/etc/systemd/system/wg-quick@.service.d/pi-config-ui-guard.conf`)
+     and every 10 minutes from cron, and logs a `WARNING` naming the
+     `.conf` to fix. The `.conf` itself is never rewritten, so the range
+     returns once the device is on a network where it's safe. It's a
+     backstop, not a substitute for this step.
 5. Enable it only once step 4 is genuinely satisfied:
    ```bash
    sudo systemctl enable --now wg-quick@<name>

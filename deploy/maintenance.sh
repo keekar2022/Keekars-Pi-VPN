@@ -5,7 +5,7 @@
 # Scheduled maintenance for this Pi, installed by deploy/deploy.sh into
 # /etc/cron.d/pi-config-ui-maintenance. Runs as root (cron.d specifies the
 # user directly). Manual invocation:
-#   sudo /opt/pi-config-ui/maintenance.sh {health|cert-renew|cleanup|os-update|ddns-update|reboot|boot-check|wifi-recovery-check|wifi-recovery-console}
+#   sudo /opt/pi-config-ui/maintenance.sh {health|cert-renew|cleanup|os-update|ddns-update|wg-guard|reboot|boot-check|wifi-recovery-check|wifi-recovery-console}
 #
 # SAFETY: must never touch a WireGuard CLIENT-role tunnel (e.g. Syd-Home)
 # — see docs/PROJECT_NOTES.md Part 3 for why (a client tunnel with
@@ -20,14 +20,15 @@ set -euo pipefail
 # mode) feature created — never a client-role tunnel.
 SERVER_TUNNELS=("Bpl-Home")
 
-# Cloudflare zone/record for cmd_ddns_update, below. This zone ID is
-# specific to this deployment's DNS zone (keekar.au) — if this project is
-# ever pointed at a different domain, update both here. DDNS_RECORD_NAME
-# is deliberately the WireGuard Bpl-Home tunnel's own public endpoint, NOT
-# CERT_CN/vpn.bpl.keekar.au (deploy.sh) — that one intentionally resolves
-# to this Pi's private LAN IP for the admin UI, see docs/RUNBOOK.md §5b/§5c.
+# Cloudflare zone for cmd_ddns_update, below. This zone ID is specific to
+# this deployment's DNS zone (keekar.au). Record names are per device and
+# come only from /etc/pi-config-ui/device.env (written by deploy.sh) —
+# never defaulted here, so one device can't overwrite another's records.
+# DDNS_RECORD_NAME is the WireGuard tunnel's public endpoint (WAN IP);
+# CERT_CN is the admin UI, which intentionally resolves to this Pi's
+# private LAN IP, see docs/RUNBOOK.md §5b/§5c.
 CF_ZONE_ID="447c0f403d88c4810bfcb945d4466748"
-DDNS_RECORD_NAME="wg.bpl.keekar.au"
+DEVICE_ENV=/etc/pi-config-ui/device.env
 
 log() {
   logger -t pi-config-ui-maintenance "$1" 2>/dev/null || true
@@ -164,6 +165,49 @@ cmd_health() {
   fi
 }
 
+cmd_wg_guard() {
+  # Runbook §9.4: a client tunnel claiming a directly connected subnet steals
+  # the LAN route (SSH lockout), e.g. after a Pi moves to a site whose LAN
+  # matches a home subnet. Trims only the live allowed-ips; the .conf stays
+  # as-is, so the range returns on a network where it's safe.
+  command -v wg >/dev/null || return 0
+  local ifs local_nets tun
+  ifs=$(wg show interfaces 2>/dev/null) || return 0
+  [ -n "$ifs" ] || return 0
+  local_nets=$(ip -4 route show scope link | awk -v w=" $ifs " '{for (i = 1; i < NF; i++) if ($i == "dev" && index(w, " " $(i + 1) " ") == 0) { print $1; break }}')
+
+  for tun in $ifs; do
+    # Client = has an Endpoint (same test as pi-wg-helperd); server tunnels are never touched.
+    grep -qE '^[[:space:]]*Endpoint[[:space:]]*=' "/etc/wireguard/${tun}.conf" 2>/dev/null || continue
+    wg show "$tun" allowed-ips | while read -r pub allowed; do
+      local split keep drop net
+      split=$(python3 - "$local_nets" $allowed <<'PY'
+import ipaddress, sys
+local = [ipaddress.ip_network(n, strict=False) for n in sys.argv[1].split()]
+keep, drop = [], []
+for arg in sys.argv[2:]:
+    try:
+        net = ipaddress.ip_network(arg, strict=False)
+    except ValueError:
+        continue
+    clash = any(l.version == net.version and net.overlaps(l) for l in local)
+    (drop if clash else keep).append(arg)
+print(",".join(keep))
+print(" ".join(drop))
+PY
+) || continue
+      keep=$(printf '%s\n' "$split" | sed -n 1p)
+      drop=$(printf '%s\n' "$split" | sed -n 2p)
+      [ -n "$drop" ] || continue
+      wg set "$tun" peer "$pub" allowed-ips "$keep"
+      for net in $drop; do
+        ip route del "$net" dev "$tun" 2>/dev/null || true
+      done
+      log "WARNING: wg-guard: $tun no longer routes $drop (overlaps local LAN: $(echo $local_nets)); fix AllowedIPs in /etc/wireguard/${tun}.conf"
+    done
+  done
+}
+
 cmd_cert_renew() {
   # Real renewal is handled by acme.sh's own root crontab entry and its
   # --reloadcmd (installed by deploy.sh's provision_tls_cert, see
@@ -275,9 +319,14 @@ cmd_os_update() {
   # warning and the reboot-required warning above.
   local venv=/opt/pi-config-ui/venv
   local pip_status=0
+  # piwheels only builds 32-bit ARM wheels; arm64 boards use PyPI.
+  local pip_index=()
+  case "$(dpkg --print-architecture)" in
+    armhf|armel) pip_index=(--index-url https://www.piwheels.org/simple) ;;
+  esac
   if [ -x "$venv/bin/pip" ]; then
     if sudo -u pi-config-ui env PIP_NO_CACHE_DIR=1 "$venv/bin/pip" install -q --timeout 60 \
-        --index-url https://www.piwheels.org/simple \
+        "${pip_index[@]}" \
         -r /opt/pi-config-ui/requirements.txt; then
       log "os-update: pip deps re-synced to requirements.txt pins"
     else
@@ -289,7 +338,7 @@ cmd_os_update() {
     # only, not a reason to fail this step.
     local outdated
     outdated=$(sudo -u pi-config-ui env PIP_NO_CACHE_DIR=1 "$venv/bin/pip" list --outdated --timeout 60 \
-      --index-url https://www.piwheels.org/simple 2>/dev/null | tail -n +3) || true
+      "${pip_index[@]}" 2>/dev/null | tail -n +3) || true
     if [ -n "$outdated" ]; then
       log "WARNING: os-update: newer versions available upstream (requirements.txt pins left untouched — review and bump manually): $(echo "$outdated" | tr '\n' ';' | sed 's/;$//')"
     fi
@@ -300,82 +349,104 @@ cmd_os_update() {
 }
 
 cmd_ddns_update() {
-  # Keeps wg.bpl.keekar.au (the WireGuard Bpl-Home tunnel's public,
-  # internet-facing endpoint — deliberately separate from
-  # vpn.bpl.keekar.au, which intentionally resolves to this Pi's private
-  # LAN IP for the admin UI, see docs/RUNBOOK.md §5b) pointed at whatever
-  # public IP this device currently has, so a move to a different network
-  # (different city/ISP, different WAN IP) doesn't leave clients dialing a
-  # stale address. No-ops quietly if the Cloudflare token from
-  # provision_tls_cert (docs/RUNBOOK.md §5b) isn't present — this device
-  # may not have a real cert/DDNS provisioned yet.
+  # Keeps this device's own records current: DDNS_RECORD_NAME (WireGuard's
+  # public endpoint) -> public IP, so a move to a different network doesn't
+  # leave clients dialing a stale address, and CERT_CN (admin UI) -> LAN IP,
+  # or the public IP when ADMIN_RECORD_TARGET=public (remote site). No-ops
+  # quietly until deploy.sh has written device.env and the Cloudflare token exists.
   local token_file=/root/.cf-dns-token
-  local zone_id="$CF_ZONE_ID"
-  local record_name="$DDNS_RECORD_NAME"
 
+  if [ ! -f "$DEVICE_ENV" ]; then
+    log "ddns-update: no $DEVICE_ENV — skipping (redeploy with CERT_CN set)"
+    return 0
+  fi
   if [ ! -f "$token_file" ]; then
     log "ddns-update: no $token_file — skipping (see docs/RUNBOOK.md §5c)"
     return 0
   fi
 
-  local cf_token current_ip
-  set -a
+  local CERT_CN="" DDNS_RECORD_NAME="" ADMIN_RECORD_TARGET="" CF_Token="" current_ip lan_ip admin_ip
+  # shellcheck disable=SC1090
+  . "$DEVICE_ENV"
   # shellcheck disable=SC1090
   . "$token_file"
-  set +a
-  cf_token="${CF_Token:-}"
-  if [ -z "$cf_token" ]; then
-    log "ERROR: ddns-update: $token_file present but CF_Token is empty"
+  if [ -z "$CF_Token" ] || [ -z "$CERT_CN" ] || [ -z "$DDNS_RECORD_NAME" ]; then
+    log "ERROR: ddns-update: CF_Token, CERT_CN or DDNS_RECORD_NAME is empty"
     return 0
   fi
 
-  current_ip=$(curl -s --max-time 20 https://ifconfig.me) || true
-  if ! [[ "$current_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    log "WARNING: ddns-update: couldn't determine current public IP (got '$current_ip'), skipping this run"
-    return 0
+  # -4: on dual-stack links (e.g. Bhopal) ifconfig.me otherwise answers with IPv6.
+  current_ip=$(curl -4 -s --max-time 20 https://ifconfig.me) || true
+  if [[ "$current_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    _cf_upsert A "$CF_Token" "$DDNS_RECORD_NAME" "$current_ip"
+  else
+    log "WARNING: ddns-update: couldn't determine current public IP (got '$current_ip'), skipping $DDNS_RECORD_NAME"
   fi
 
-  local lookup record_id existing_ip
-  lookup=$(curl -s --max-time 20 \
-    -H "Authorization: Bearer $cf_token" -H "Content-Type: application/json" \
-    "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?name=${record_name}") || true
+  # IPv6 has no NAT, so the interface's stable (non-temporary) global address
+  # is the public one; ULA (fc00::/7) isn't routable. None -> stale AAAA removed.
+  local ipv6
+  ipv6=$(ip -6 -o addr show scope global 2>/dev/null | grep -v -e temporary -e deprecated \
+    | awk '{sub(/\/.*/, "", $4); print $4}' | grep -iv '^f[cd]' | head -1) || true
+  _cf_upsert AAAA "$CF_Token" "$DDNS_RECORD_NAME" "$ipv6"
 
-  record_id=$(python3 -c "
+  lan_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+  case "${ADMIN_RECORD_TARGET:-lan}" in
+    public) [[ "$current_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && admin_ip="$current_ip" || admin_ip="" ;;
+    *) admin_ip="$lan_ip" ;;
+  esac
+  if [ -n "$admin_ip" ]; then
+    _cf_upsert A "$CF_Token" "$CERT_CN" "$admin_ip"
+  else
+    log "WARNING: ddns-update: no ${ADMIN_RECORD_TARGET:-lan} IP found, skipping $CERT_CN"
+  fi
+}
+
+# Creates the record if missing, updates it when the IP changed, and deletes
+# it when ip is empty (e.g. the device moved to a network without IPv6).
+_cf_upsert() {
+  local type="$1" token="$2" name="$3" ip="$4" api lookup found record_id existing_ip="" resp
+  api="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"
+  lookup=$(curl -s --max-time 20 -H "Authorization: Bearer $token" \
+    "${api}?type=${type}&name=${name}") || true
+  found=$(python3 -c "
 import json, sys
 try:
-    r = json.loads(sys.argv[1])['result']
-    print(r[0]['id'] if r else '')
+    j = json.loads(sys.argv[1])
+    r = j['result'] if j.get('success') else None
+    print('ERR' if r is None else (r[0]['id'] + ' ' + r[0]['content'] if r else 'NEW'))
 except Exception:
-    print('')
+    print('ERR')
 " "$lookup")
-  existing_ip=$(python3 -c "
-import json, sys
-try:
-    r = json.loads(sys.argv[1])['result']
-    print(r[0]['content'] if r else '')
-except Exception:
-    print('')
-" "$lookup")
+  read -r record_id existing_ip <<<"$found"
 
-  if [ -z "$record_id" ]; then
-    log "ERROR: ddns-update: no DNS record found for $record_name — create it once manually (see docs/RUNBOOK.md), this script only updates an existing record"
-    return 0
-  fi
-
-  if [ "$existing_ip" = "$current_ip" ]; then
-    return 0
-  fi
-
-  local resp
-  resp=$(curl -s --max-time 20 -X PATCH \
-    -H "Authorization: Bearer $cf_token" -H "Content-Type: application/json" \
-    --data "{\"content\":\"${current_ip}\"}" \
-    "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}") || true
+  case "$record_id" in
+    ERR)
+      log "ERROR: ddns-update: Cloudflare lookup failed for $name ($type)"
+      return 0 ;;
+    NEW)
+      [ -n "$ip" ] || return 0
+      resp=$(curl -s --max-time 20 -X POST \
+        -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+        --data "{\"type\":\"${type}\",\"name\":\"${name}\",\"content\":\"${ip}\",\"ttl\":300,\"proxied\":false}" \
+        "$api") || true ;;
+    *)
+      [ "$existing_ip" = "$ip" ] && return 0
+      if [ -z "$ip" ]; then
+        resp=$(curl -s --max-time 20 -X DELETE \
+          -H "Authorization: Bearer $token" "${api}/${record_id}") || true
+      else
+        resp=$(curl -s --max-time 20 -X PATCH \
+          -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+          --data "{\"content\":\"${ip}\"}" \
+          "${api}/${record_id}") || true
+      fi ;;
+  esac
 
   if echo "$resp" | grep -q '"success":true'; then
-    log "ddns-update: $record_name updated $existing_ip -> $current_ip"
+    log "ddns-update: $name $type -> ${ip:-deleted} (was ${existing_ip:-no record})"
   else
-    log "ERROR: ddns-update: Cloudflare update failed: $resp"
+    log "ERROR: ddns-update: Cloudflare update failed for $name ($type): $resp"
   fi
 }
 
@@ -725,9 +796,10 @@ case "${1:-}" in
   cleanup) run_system_locked 0 cleanup cmd_cleanup ;;
   os-update) run_system_locked 0 os-update cmd_os_update ;;
   ddns-update) cmd_ddns_update ;;
+  wg-guard) cmd_wg_guard ;;
   reboot) run_system_locked 7200 reboot cmd_reboot ;;
   boot-check) run_system_locked 0 boot-check cmd_boot_check ;;
   wifi-recovery-check) cmd_wifi_recovery_check ;;
   wifi-recovery-console) cmd_wifi_recovery_console ;;
-  *) echo "Usage: $0 {health|cert-renew|cleanup|os-update|ddns-update|reboot|boot-check|wifi-recovery-check|wifi-recovery-console}" >&2; exit 1 ;;
+  *) echo "Usage: $0 {health|cert-renew|cleanup|os-update|ddns-update|wg-guard|reboot|boot-check|wifi-recovery-check|wifi-recovery-console}" >&2; exit 1 ;;
 esac

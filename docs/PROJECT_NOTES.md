@@ -539,3 +539,117 @@ Flagged but not fixed as part of this pass: `Visheshs_MacBook` (another
 existing peer, `10.6.0.5/32`) shows the identical broken-handshake
 signature (0 B received, tens of MiB sent, "Latest Handshake: never") —
 worth checking whether it has the same missing-PSK problem.
+
+## Part 4 — Second device (Walnut Pi) and the Bhopal move (v1.0.2, 2026-09-28/29)
+
+A Raspberry Pi Zero 2 W was out of stock, so the second device is a
+**Walnut Pi Zero W** (`walnutpi-zerow`, Armbian 26.11 on Debian 13,
+`arm64`, 4 cores, ~1GB RAM, 2.4/5 GHz Wi-Fi). It became `vpn2.bpl` /
+`wg2.bpl`, WireGuard client `10.6.0.7`, server `Bpl-Home` on
+`10.7.0.1/24` UDP 51821, while `pi0w-1` shipped to Bhopal (Airtel,
+dual-stack) keeps `vpn.bpl` / `wg.bpl`, client `10.6.0.6`.
+
+### Headless Armbian install
+
+The Armbian imager has no Wi-Fi preset for this board; the first-boot
+preset file `/root/.not_logged_in_yet` (`PRESET_NET_WIFI_*`,
+`PRESET_ROOT_PASSWORD`, …) sits on the image's ext4 partition, which macOS
+can't write — edited via a privileged Debian container mounting the image
+at the partition offset. Reflashing gives new SSH host keys on the same
+IP, so `ssh-keygen -R <ip>` is expected, not an attack.
+
+### Incident: netplan kept Wi-Fi away from NetworkManager
+
+The Network tab and Wi-Fi recovery drive `nmcli`, but Armbian renders
+Wi-Fi through netplan → systemd-networkd. Three separate blockers, each
+found only after the previous fix:
+1. NetworkManager's postinst starts it immediately; it's held off every
+   interface (`unmanaged-devices=*`) until the handover.
+2. `netplan apply` left `netplan-wpa-wlan0.service` owning the radio, so
+   NetworkManager logged `wpa_supplicant couldn't grab this interface`.
+3. netplan's udev rule had tagged `wlan0` `NM_UNMANAGED=1` at boot, and
+   `netplan generate` doesn't re-evaluate an already-present device —
+   `udevadm trigger --action=change` does.
+
+The handover runs detached (`systemd-run`) because SSH drops with Wi-Fi,
+and rolled back cleanly on both failed attempts. On success the router
+gave a new IP (NetworkManager's DHCP client ID differs from networkd's);
+`avahi-daemon` + a `<hostname>.local` fallback pinned to the original host
+key now lets `deploy.sh` continue on its own.
+
+### Incident: the "already CA-issued" check was always true
+
+`provision_tls_cert` compared `openssl x509 -issuer` with `-subject`
+output; the prefixes (`issuer=` vs `subject=`) always differ, so every
+self-signed cert looked CA-issued and a real one was never requested.
+Fixed by comparing the DNs themselves plus `-checkhost "$CERT_CN"`.
+
+### Incident: acme.sh waited forever on a DoH-blocking LAN
+
+The LAN resolver (`192.168.1.200`) answers `cloudflare-dns.com` and
+`dns.google` with `0.0.0.0`. The DNS-01 TXT record was live on
+Cloudflare's authoritative servers within seconds, but acme.sh's
+DoH-based propagation check could never see it. `--dnssleep 60` replaces
+the check with a fixed wait.
+
+### Incident: one device's DNS names would have overwritten another's
+
+`maintenance.sh` hardcoded `wg.bpl.keekar.au`, so the second device would
+have repointed the shipped device's WireGuard endpoint the moment it got a
+token. Names now live only in each device's `device.env`, a first deploy
+refuses to run without `CERT_CN`, and missing records are created.
+Separately, local DNS intercepts queries even when sent to public
+resolvers (`vpn2.bpl` answered `192.168.1.101`, public lookups
+`10.100.3.74`), so record contents were verified via the Cloudflare API,
+not `dig`.
+
+### Incident: Bhopal's DDNS stayed on Sydney's IP
+
+`pi0w-1` had no Cloudflare token, so `ddns-update` silently skipped every
+run since shipping. With the token added it still published nothing:
+`ifconfig.me` answered the dual-stack link with IPv6
+(`2401:4900:…`), which the IPv4-only check rejected. `curl -4` fixed the
+`A` record; the stable global IPv6 is now published as `AAAA` (EUI-64,
+not a rotating privacy address). The admin name also pointed at Sydney's
+WAN IP; `ADMIN_RECORD_TARGET=public` makes it follow the site's public
+IPv4 for remote devices, while home devices keep the LAN IP.
+
+### Incident: remote Pi handshaking but unreachable
+
+pfSense showed `Pi0w-1` handshaking every few seconds, yet nothing
+reached it. Three independent faults, found in order:
+1. **Server-side `AllowedIPs` overlap (pfSense)**: peer entries had been
+   given client-side LAN prefixes, and the cloned `Pi0w-2` entry also
+   claimed `10.6.0.6/32`. Server-side `AllowedIPs` is a crypto-routing
+   table where each prefix belongs to exactly one peer, so `Pi0w-1` ended
+   with none — handshakes (matched by key) kept succeeding while no data
+   could route to it. Fixed by giving every peer only its own `/32`.
+2. **Client-side `AllowedIPs` too narrow**: `pi0w-1` accepted only
+   `192.168.2.0/24, 192.168.3.0/24`, dropping replies to `10.6.0.x`.
+   `10.6.0.0/24` was added; `192.168.1.0/24` was deliberately *not*,
+   because Bhopal's LAN is also `192.168.1.0/24` — the exact overlap that
+   caused the original lockout. That's why `wg-guard` now exists: a
+   device moved to a site whose LAN matches a home subnet trims the
+   overlap itself at tunnel start, instead of locking itself out.
+3. **pfSense LAN rule**: SSH from the Sydney LAN hit the catch-all
+   `L0-99 Block Unidentified` reject (answered in 0.08 ms, never entering
+   `tun_wg0`) because the new pass rule targeted `10.6.0.1` instead of
+   `10.6.0.0/24`; HTTPS worked via an older rule. Outbound NAT
+   (`LAN → 10.6.0.0/24` as `10.6.0.1`) was already correct.
+
+### Operational notes
+
+- DHCP hands out `192.168.1.200` and `192.168.1.1` as DNS; only `.200` has
+  the split-horizon records (`sso.keekar.au`). When `systemd-resolved`
+  fails over to `.1`, SSO breaks until it switches back — fix on the
+  router, not the Pi.
+- On 5 GHz, the Mac's ARP for the Walnut Pi briefly went unanswered
+  (`incomplete`) while IPv6/mDNS worked; a DHCP reservation plus the
+  `.local` name avoids depending on it.
+- A pre-shared key file handed over for setup was world-readable (644) and
+  its `Public_Key` was `pi0w-1`'s — reusing it would have repeated
+  Incident 1 (Part 3). The Walnut Pi got its own keypair; the file was made
+  root-only.
+- A site script on `pi0w-1` (`mqtt-monitor.sh`, not in this repo) holds a
+  plaintext MQTT password and sits under `/opt/pi-config-ui`, whose
+  ownership every deploy resets — move it out and rotate the password.
