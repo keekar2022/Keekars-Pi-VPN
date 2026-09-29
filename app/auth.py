@@ -4,16 +4,22 @@
 import logging
 import ssl
 
+import httpx
 import truststore
+from authlib.integrations.base_client.errors import OAuthError
 from authlib.integrations.starlette_client import OAuth
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 
 from app.config import settings
+from app.templating import error_page
 
 logger = logging.getLogger("pi_config_ui.auth")
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+# DNS/connect/TLS failures reaching the IdP, or a bad discovery document.
+_IDP_UNREACHABLE = (httpx.HTTPError, OSError, OAuthError, ValueError)
 
 # Use the OS-native certificate trust store (macOS Keychain / Windows cert
 # store / Linux system store) instead of the bundled `certifi` list.
@@ -46,7 +52,20 @@ oauth.register(
 
 @router.get("/login")
 async def login(request: Request):
-    response = await oauth.sso.authorize_redirect(request, settings.sso_redirect_uri)
+    try:
+        response = await oauth.sso.authorize_redirect(request, settings.sso_redirect_uri)
+    except _IDP_UNREACHABLE as exc:
+        logger.warning("sso_login_idp_unreachable error=%r", str(exc))
+        return error_page(
+            request,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Sign-in service unreachable",
+            "This device can't reach the sign-in service right now (often a DNS problem on the network). "
+            "It usually recovers within a few minutes.",
+            "/auth/login",
+            "Try again",
+            headers={"Retry-After": "30"},
+        )
     logger.info(
         "sso_login_initiated had_session_cookie=%r new_state=%r",
         "session" in request.cookies,
@@ -94,7 +113,18 @@ async def callback(request: Request):
 @router.get("/logout")
 async def logout(request: Request):
     request.session.clear()
-    metadata = await oauth.sso.load_server_metadata()
+    try:
+        metadata = await oauth.sso.load_server_metadata()
+    except _IDP_UNREACHABLE as exc:
+        logger.warning("sso_logout_idp_unreachable error=%r", str(exc))
+        return error_page(
+            request,
+            status.HTTP_200_OK,
+            "Signed out",
+            "You're signed out of this device. The sign-in service couldn't be reached to end that session too.",
+            "/auth/login",
+            "Sign in again",
+        )
     end_session_endpoint = metadata.get("end_session_endpoint")
     if end_session_endpoint:
         return RedirectResponse(url=end_session_endpoint)

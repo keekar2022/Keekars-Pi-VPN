@@ -637,6 +637,21 @@ reached it. Three independent faults, found in order:
    `10.6.0.0/24`; HTTPS worked via an older rule. Outbound NAT
    (`LAN → 10.6.0.0/24` as `10.6.0.1`) was already correct.
 
+### Incident: login redirect loop when SSO was unreachable (v1.0.3)
+
+The Walnut Pi's UI failed with `ERR_TOO_MANY_REDIRECTS`. Its resolver had
+failed over to `192.168.1.1`, which has no `sso.keekar.au` record, so
+`/auth/login`'s OIDC discovery fetch raised `httpx.ConnectError`. The
+catch-all exception handler turned that into a redirect to `/`, and a
+signed-out `/` redirects to `/auth/login` — a loop the browser cut off
+after ~20 hops. Two fixes: the auth routes now render a 503 page instead
+of redirecting (and the handler never redirects `/` or `/auth/*`), and
+`SPLIT_DNS=keekar.au=192.168.1.200` pins `keekar.au` lookups to the
+split-horizon server with a systemd-resolved routing domain. Verified by
+forcing `wlan0` to `.1` only (`sso.keekar.au` still resolved via the
+route to `.200`) and by a self-restoring `/etc/hosts` outage (`/` →
+`/auth/login` → 503, one redirect).
+
 ### Operational notes
 
 - DHCP hands out `192.168.1.200` and `192.168.1.1` as DNS; only `.200` has

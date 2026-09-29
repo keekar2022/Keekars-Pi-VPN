@@ -9,14 +9,12 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from app import __version__, monitor, network, routing, system, wireguard
 from app.auth import current_user, router as auth_router
 from app.config import settings
-
-APP_TITLE = "Keekar's Pi VPN"
+from app.templating import APP_TITLE, error_page, templates
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,9 +47,6 @@ app.add_middleware(
 )
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
-templates = Jinja2Templates(directory="app/templates")
-templates.env.globals["app_title"] = APP_TITLE
-templates.env.globals["app_version"] = __version__
 
 app.include_router(auth_router)
 app.include_router(network.router)
@@ -95,6 +90,9 @@ async def wireguard_page(request: Request, user=Depends(current_user)):
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     logging.getLogger("pi_config_ui").exception("unhandled_exception", extra={"event": "http.unhandled_exception"})
-    if request.method == "GET":
+    # "/" and /auth/* are where a redirect would loop back to themselves (via current_user).
+    if request.method == "GET" and request.url.path != "/" and not request.url.path.startswith("/auth/"):
         return RedirectResponse(url="/")
+    if request.method == "GET":
+        return error_page(request, 500, "Something went wrong", "The page couldn't be loaded.", "/", "Try again")
     return JSONResponse(status_code=500, content={"detail": "Internal error"})

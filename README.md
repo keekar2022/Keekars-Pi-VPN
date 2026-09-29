@@ -120,7 +120,7 @@ device in `/etc/pi-config-ui/device.env`, so later runs omit them):
 
 ```
 PI_HOST=root@192.168.1.24 CERT_CN=vpn2.bpl.keekar.au \
-  WIFI_EXTRA_SSIDS="keekar5G" ./deploy/deploy.sh
+  SPLIT_DNS=keekar.au=192.168.1.200 WIFI_EXTRA_SSIDS="keekar5G" ./deploy/deploy.sh
 # device at a remote site: admin name resolves to its public IP
 PI_HOST=mkesharw@10.6.0.6 CERT_CN=vpn.bpl.keekar.au ADMIN_RECORD_TARGET=public \
   ./deploy/deploy.sh --skip-deps

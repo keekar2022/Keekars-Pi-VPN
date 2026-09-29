@@ -106,6 +106,35 @@ class MaintenancePolicyTests(unittest.TestCase):
         self.assertIn("grep -iv '^f[cd]'", source)
         self.assertIn("-X DELETE", source)
 
+    def test_split_dns_is_opt_in_validated_and_removable(self):
+        source = DEPLOY_SCRIPT.read_text()
+
+        self.assertIn('SPLIT_DNS="${SPLIT_DNS:-}"', source)
+        self.assertIn('[ "$SPLIT_DNS" = "none" ] && SPLIT_DNS=""', source)
+        self.assertIn("SPLIT_DNS must look like keekar.au=192.168.1.200", source)
+        # Routing-only domain, so every other lookup keeps the normal servers.
+        self.assertIn("Domains=~%s", source)
+        self.assertIn('rm -f "$SPLIT_CONF"', source)
+
+    def test_health_restarts_resolver_once_when_sso_does_not_resolve(self):
+        body = re.search(r"cmd_health\(\) \{(.*?)\n\}\n", MAINTENANCE_SCRIPT.read_text(), re.S).group(1)
+
+        self.assertEqual(body.count("systemctl restart systemd-resolved"), 1)
+        self.assertIn('getent hosts "$issuer_host"', body)
+
+    def test_health_reads_only_the_issuer_host_from_sso_env(self):
+        body = re.search(r"cmd_health\(\) \{(.*?)\n\}\n", MAINTENANCE_SCRIPT.read_text(), re.S).group(1)
+        sed_expr = re.search(r"sed -n '(.*?)' /etc/pi-config-ui/sso.env", body).group(1).replace("'\\''", "'")
+        sample = (
+            "SSO_ISSUER=https://sso.example.test\n"
+            "SSO_CLIENT_SECRET=do-not-print\n"
+            "SESSION_SECRET=do-not-print\n"
+        )
+
+        out = subprocess.run(["sed", "-n", sed_expr], input=sample, capture_output=True, text=True, check=True).stdout
+
+        self.assertEqual(out.strip(), "sso.example.test")
+
     def test_admin_record_can_point_at_public_ip_for_remote_sites(self):
         deploy = DEPLOY_SCRIPT.read_text()
         maintenance = MAINTENANCE_SCRIPT.read_text()

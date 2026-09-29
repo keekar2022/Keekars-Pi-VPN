@@ -6,6 +6,31 @@ Contact: mukesh.kesharwani@adobe.com
 
 # Release notes
 
+## 1.0.3 — 2026-09-29
+
+### Fixed
+
+- **`ERR_TOO_MANY_REDIRECTS` when the sign-in service is unreachable.**
+  `/auth/login` must fetch Authentik's OIDC metadata before redirecting;
+  when that failed, the catch-all error handler redirected to `/`, which
+  (signed out) redirected back to `/auth/login` — forever. `/auth/login`
+  now shows a 503 "Sign-in service unreachable" page (`Retry-After: 30`),
+  `/auth/logout` still signs you out, and the error handler never
+  redirects `/` or `/auth/*`.
+
+### New
+
+- **`SPLIT_DNS`** (`deploy.sh`, e.g. `SPLIT_DNS=keekar.au=192.168.1.200`):
+  sends only that domain's lookups to that server via systemd-resolved,
+  so `sso.keekar.au` keeps resolving when the resolver falls back to a DNS
+  server without the split-horizon records. Per device and opt-in (a
+  remote-site device can't reach the home DNS server); saved in
+  `device.env`, `SPLIT_DNS=none` removes it.
+- **`maintenance.sh health`** checks that the SSO issuer resolves; if not,
+  it restarts systemd-resolved once and logs a `WARNING`/`ERROR`.
+- `deploy.sh` verification prints `/auth/login`'s status (302 = SSO
+  reachable, 503 = not).
+
 ## 1.0.2 — 2026-09-29
 
 Adds support for the **Walnut Pi Zero W** (Armbian, arm64) alongside the

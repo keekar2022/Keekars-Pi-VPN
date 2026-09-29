@@ -335,6 +335,14 @@ with a connect-timeout that has nothing to do with the network.
    `"code_challenge_method": "S256"` in `client_kwargs` — authlib's
    `authorize_redirect()` does **not** add PKCE automatically; this is a
    "don't accidentally remove it" callout, not a step to perform.
+4. **The device must always be able to resolve `sso.keekar.au`.** It's a
+   split-horizon name only `192.168.1.200` answers; DHCP also hands out
+   `192.168.1.1`, and when systemd-resolved fails over to it, sign-in
+   breaks (1.0.3+ shows a 503 "Sign-in service unreachable" page; older
+   builds looped with `ERR_TOO_MANY_REDIRECTS`). On home-LAN devices,
+   deploy once with `SPLIT_DNS=keekar.au=192.168.1.200` to pin that domain
+   to `.200`; `maintenance.sh health` also restarts the resolver once if
+   the issuer stops resolving. Check with `resolvectl query sso.keekar.au`.
 
 ## 5. TLS keypair for the app itself
 

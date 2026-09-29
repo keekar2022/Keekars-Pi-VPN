@@ -10,6 +10,7 @@
 
 import re
 
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -100,3 +101,55 @@ def test_csp_header_never_allows_unsafe_inline(authenticated_client, path):
     csp = response.headers.get("content-security-policy", "")
     assert csp, f"{path} is missing a Content-Security-Policy header"
     assert "unsafe-inline" not in csp.lower()
+
+
+@pytest.fixture
+def idp_unreachable(monkeypatch):
+    # Exactly what the Walnut Pi hit when its resolver fell back to a DNS
+    # server without the split-horizon sso.keekar.au record.
+    async def failing_load_server_metadata(*args, **kwargs):
+        raise httpx.ConnectError("[Errno 16] Device or resource busy")
+
+    monkeypatch.setattr(oauth.sso, "load_server_metadata", failing_load_server_metadata)
+
+
+def test_login_shows_503_page_not_redirect_when_idp_unreachable(client, idp_unreachable):
+    response = client.get("/auth/login", follow_redirects=False)
+
+    assert response.status_code == 503
+    assert "location" not in response.headers
+    assert response.headers.get("retry-after") == "30"
+    assert "Sign-in service unreachable" in response.text
+
+
+def test_logout_still_signs_out_when_idp_unreachable(client, idp_unreachable):
+    response = client.get("/auth/logout", follow_redirects=False)
+
+    assert response.status_code == 200
+    assert "location" not in response.headers
+    assert "Signed out" in response.text
+
+
+def test_signed_out_root_never_loops_when_idp_unreachable(idp_unreachable):
+    # Before the fix: / -> /auth/login -> (error) / -> ... until the browser
+    # gave up with ERR_TOO_MANY_REDIRECTS; httpx raises TooManyRedirects likewise.
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.get("/")
+
+    assert response.status_code == 503
+    assert len(response.history) <= 1
+
+
+def test_unhandled_error_on_root_is_a_page_not_a_redirect(monkeypatch):
+    def broken_user():
+        raise RuntimeError("boom")
+
+    app.dependency_overrides[current_user] = broken_user
+    try:
+        response = TestClient(app, raise_server_exceptions=False).get("/", follow_redirects=False)
+    finally:
+        app.dependency_overrides.pop(current_user, None)
+
+    assert response.status_code == 500
+    assert "location" not in response.headers

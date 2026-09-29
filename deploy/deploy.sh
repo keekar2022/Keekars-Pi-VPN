@@ -33,6 +33,11 @@
 #   ADMIN_RECORD_TARGET  lan (default) or public: which IP CERT_CN resolves
 #                     to. Use public for a device at a remote site whose LAN
 #                     isn't reachable (e.g. Bhopal); saved in device.env.
+#   SPLIT_DNS         domain=IPv4, e.g. keekar.au=192.168.1.200: send only
+#                     that domain's lookups to that server (systemd-resolved),
+#                     so SSO keeps resolving when DHCP also hands out a DNS
+#                     server without the split-horizon records. Home-LAN
+#                     devices only; saved in device.env, SPLIT_DNS=none removes it.
 #   CF_PASS_ENTRY     `pass` entry holding API_TOKEN=<Cloudflare token with
 #                     Zone:DNS:Edit on keekar.au> and Account_ID=<id>;
 #                     default KeekarACI/Cloudflare, set empty to skip.
@@ -67,6 +72,7 @@ PI_HOST="${PI_HOST:-}"
 CERT_CN="${CERT_CN:-}"
 DDNS_RECORD_NAME="${DDNS_RECORD_NAME:-}"
 ADMIN_RECORD_TARGET="${ADMIN_RECORD_TARGET:-}"
+SPLIT_DNS="${SPLIT_DNS:-}"
 ACME_EMAIL="${ACME_EMAIL:-}"
 CF_PASS_ENTRY="${CF_PASS_ENTRY-KeekarACI/Cloudflare}"
 WIFI_EXTRA_SSIDS="${WIFI_EXTRA_SSIDS:-}"
@@ -125,11 +131,19 @@ preflight() {
     exit 1
   fi
 
-  local saved saved_cn saved_ddns saved_admin
+  local saved saved_cn saved_ddns saved_admin saved_split
   saved=$(pi_ssh "$PI_HOST" 'cat /etc/pi-config-ui/device.env 2>/dev/null' || true)
   saved_cn=$(printf '%s\n' "$saved" | sed -n 's/^CERT_CN=//p')
   saved_ddns=$(printf '%s\n' "$saved" | sed -n 's/^DDNS_RECORD_NAME=//p')
   saved_admin=$(printf '%s\n' "$saved" | sed -n 's/^ADMIN_RECORD_TARGET=//p')
+  saved_split=$(printf '%s\n' "$saved" | sed -n 's/^SPLIT_DNS=//p')
+  SPLIT_DNS="${SPLIT_DNS:-$saved_split}"
+  [ "$SPLIT_DNS" = "none" ] && SPLIT_DNS=""
+  local split_re='^[a-z0-9]([a-z0-9.-]*[a-z0-9])?=[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+  if [ -n "$SPLIT_DNS" ] && ! [[ "$SPLIT_DNS" =~ $split_re ]]; then
+    warn "SPLIT_DNS must look like keekar.au=192.168.1.200 (or none)."
+    exit 1
+  fi
   ADMIN_RECORD_TARGET="${ADMIN_RECORD_TARGET:-${saved_admin:-lan}}"
   case "$ADMIN_RECORD_TARGET" in
     lan|public) ;;
@@ -188,11 +202,24 @@ install -d -o pi-config-ui -g pi-config-ui -m 0755 /etc/pi-config-ui/monitor
 install -d -o root -g root -m 0755 /etc/pi-config-ui/monitor/pkg-backups
 REMOTE
 
-  remote_with CERT_CN DDNS_RECORD_NAME ADMIN_RECORD_TARGET <<'REMOTE'
+  remote_with CERT_CN DDNS_RECORD_NAME ADMIN_RECORD_TARGET SPLIT_DNS <<'REMOTE'
 set -euo pipefail
 # Read by maintenance.sh ddns-update and by later deploys (see preflight).
-printf 'CERT_CN=%s\nDDNS_RECORD_NAME=%s\nADMIN_RECORD_TARGET=%s\n' "$CERT_CN" "$DDNS_RECORD_NAME" "$ADMIN_RECORD_TARGET" > /etc/pi-config-ui/device.env
+printf 'CERT_CN=%s\nDDNS_RECORD_NAME=%s\nADMIN_RECORD_TARGET=%s\nSPLIT_DNS=%s\n' "$CERT_CN" "$DDNS_RECORD_NAME" "$ADMIN_RECORD_TARGET" "$SPLIT_DNS" > /etc/pi-config-ui/device.env
 chmod 644 /etc/pi-config-ui/device.env
+SPLIT_CONF=/etc/systemd/resolved.conf.d/pi-config-ui-split.conf
+if [ -n "$SPLIT_DNS" ] && systemctl is-active --quiet systemd-resolved; then
+  install -d /etc/systemd/resolved.conf.d
+  # "~domain" = routing-only: just this domain goes to this server.
+  printf '[Resolve]\nDNS=%s\nDomains=~%s\n' "${SPLIT_DNS#*=}" "${SPLIT_DNS%%=*}" > "$SPLIT_CONF"
+  systemctl restart systemd-resolved
+  echo "Split DNS: ${SPLIT_DNS%%=*} -> ${SPLIT_DNS#*=}"
+elif [ -n "$SPLIT_DNS" ]; then
+  echo "WARNING: SPLIT_DNS set but systemd-resolved isn't running here; skipped."
+elif [ -f "$SPLIT_CONF" ]; then
+  rm -f "$SPLIT_CONF"
+  systemctl restart systemd-resolved
+fi
 CERT=/etc/pi-config-ui/tls/cert.pem
 self_signed() {
   [ "$(openssl x509 -in "$CERT" -noout -issuer -nameopt RFC2253 | cut -d= -f2-)" = \
@@ -750,6 +777,8 @@ else
     fi
   done
 fi
+echo "-- SSO reachable (expect 302 to the IdP; 503 = the device can't reach it) --"
+curl -sk -o /dev/null -w "/auth/login: %{http_code}\n" "https://localhost:${PORT}/auth/login"
 echo "-- Syd-Home client tunnel state (must be UNCHANGED by this script) --"
 systemctl is-enabled wg-quick@Syd-Home 2>/dev/null || echo "not present"
 systemctl is-active wg-quick@Syd-Home 2>/dev/null || echo "not active"

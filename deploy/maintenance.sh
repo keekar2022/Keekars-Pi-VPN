@@ -151,6 +151,22 @@ cmd_health() {
     fi
   done
 
+  local issuer_host
+  # Only the issuer URL's host is read from sso.env; the rest holds secrets.
+  issuer_host=$(sed -n 's#^SSO_ISSUER=["'\'']*https*://\([^/:"'\'']*\).*#\1#p' /etc/pi-config-ui/sso.env 2>/dev/null | head -1) || true
+  issuer_host="${issuer_host:-sso.keekar.au}"
+  if ! getent hosts "$issuer_host" >/dev/null; then
+    # resolved can fail over to a DNS server without the split-horizon record,
+    # which makes /auth/login unusable until it switches back.
+    if systemctl is-active --quiet systemd-resolved; then
+      log "WARNING: health: $issuer_host doesn't resolve, restarting systemd-resolved"
+      systemctl restart systemd-resolved || true
+      sleep 2
+    fi
+    getent hosts "$issuer_host" >/dev/null \
+      || log "ERROR: health: $issuer_host still doesn't resolve; SSO login unavailable (check DNS or SPLIT_DNS)"
+  fi
+
   local port code
   port=$(ss -tlnp 2>/dev/null | grep uvicorn | grep -oE ':[0-9]+' | head -1 | tr -d ':') || true
   port="${port:-443}"
