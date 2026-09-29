@@ -668,3 +668,89 @@ route to `.200`) and by a self-restoring `/etc/hosts` outage (`/` →
 - A site script on `pi0w-1` (`mqtt-monitor.sh`, not in this repo) holds a
   plaintext MQTT password and sits under `/opt/pi-config-ui`, whose
   ownership every deploy resets — move it out and rotate the password.
+  **Resolved in Part 5**: superseded by `pi-telemetryd`, backed up to
+  `/root/mqtt-monitor.sh.bak-<date>` and removed; the broker account it
+  used is no longer needed.
+
+## Part 5 — MQTT telemetry into Home Assistant (v1.0.4, 2026-09-29)
+
+Both Pis now publish health telemetry to the Mosquitto broker on the Home
+Assistant box and appear there as devices. See
+[`RUNBOOK.md`](RUNBOOK.md) §5g for the operational detail; this records
+why it was built the way it was.
+
+### The constraint that shaped the design
+
+The brief was "do not lose SSH to any of these devices" — `pi0w-1` is in
+Bhopal, and while it has Raspberry Pi Connect as an out-of-band fallback,
+the Walnut Pi has nothing equivalent. Part 3's lockout came from a
+network-config change made to enable a feature.
+
+So the feature was deliberately built to need **no network change at
+all**. The very first action was a read-only reachability probe from each
+Pi, before a single byte was written anywhere:
+
+| From | `192.168.1.201:1883` | `192.168.2.201:1883` |
+| --- | --- | --- |
+| `walnutpi-zerow` (home LAN) | open | open (via `Syd-Home`) |
+| `pi0w-1` (Bhopal) | **fail** | open (via `Syd-Home`) |
+
+The HA box is dual-homed, and `192.168.2.0/24` was **already** in
+`pi0w-1`'s client `AllowedIPs` from Part 4. So Bhopal reaches the broker
+on `192.168.2.201` over the existing tunnel with no routing, `AllowedIPs`
+or firewall change. Each device is configured with the address it can
+already reach, rather than forcing one uniform value and having to widen
+routing to make it true.
+
+`pi0w-1`'s `wlan0` is `192.168.1.19` — its *Bhopal* LAN happens to reuse
+the same `192.168.1.0/24` as home. That overlap is exactly why Part 4
+excluded `192.168.1.0/24` from its `AllowedIPs`, and why `192.168.1.201`
+is unreachable from there. Not a coincidence worth forgetting.
+
+Deployment used targeted `deploy.sh --only <func>` runs, never a full
+pass: a full run does `apt-get`, the NetworkManager migration and
+`systemctl restart NetworkManager`, which is the actual lockout risk on a
+remote device. The Walnut Pi (recoverable, on the LAN) went first and was
+soaked before Bhopal was touched.
+
+### Things that only showed up on real hardware
+
+1. **`thermal_zone0` is not the CPU on both boards.** It is on the
+   Raspberry Pi Zero W (`cpu-thermal`), but on the Walnut Pi zone0 is
+   `gpu-thermal` and the CPU is zone2. The legacy `mqtt-monitor.sh` read
+   zone0 unconditionally and had been reporting the GPU. Zones are now
+   matched by `type`.
+2. **A `pass` entry with no trailing newline corrupted the env file.**
+   `pass insert -m` stores exactly what it is given; concatenating
+   `pass show` output with further lines ran `TELEMETRY_DEVICE_ID=` onto
+   the end of the password. Caught by printing the password's *length*
+   on-device — a plain `cat` would have shown nothing wrong, because the
+   redaction regex swallowed the whole corrupted line.
+3. **The first state message never arrived.** The publish loop ran before
+   `connect_async` completed, and paho drops QoS 0 publishes while
+   disconnected — silently, with no error to log. HA sat with a device
+   and no state for a full interval. Fixed by publishing from the
+   `on_connect` callback and skipping publishes while disconnected.
+4. **The first CPU reading is 100%, and that is correct.** On a 1GHz
+   single core, Python's own startup saturates the CPU across the short
+   window between priming `cpu_percent` and the first publish. It settles
+   on the next tick; not worth code.
+
+### Deliberate non-choices
+
+- **No TLS.** Traffic crosses WireGuard or the local LAN. TLS on the HA
+  Mosquitto add-on would need a certificate with a SAN for
+  `192.168.2.201`, which the Let's Encrypt cert for `hass.keekar.au` does
+  not have — meaning a self-signed CA pinned on every device, for a link
+  that is already encrypted.
+- **No privileged helper.** Unlike WireGuard (`pi-wg-helperd`), nothing
+  here needs root: `/proc`, `/sys` and the state file are all
+  world-readable. The unit therefore runs with no capabilities and no
+  writable paths at all.
+- **No new downtime logic.** `app/monitor.py`'s heartbeat stays the sole
+  writer of `state.json`; the agent only reads it. "Down right now" is
+  the MQTT Last Will's job.
+- **Not inside the FastAPI app.** Telemetry must survive app restarts,
+  and `app.config.Settings` hard-fails without SSO credentials at import
+  time — which is why the shared collectors were split into
+  `app/metrics.py` rather than imported from `app/monitor.py`.

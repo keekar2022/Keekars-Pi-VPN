@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 venv/
 sso.env
+telemetry.env
 *.nmconnection
 .DS_Store
 .pytest_cache/

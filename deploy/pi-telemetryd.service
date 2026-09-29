@@ -1,0 +1,52 @@
+# Concept: Mukesh Kesharwani
+# Contact: mukesh.kesharwani@adobe.com
+#
+# MQTT telemetry agent — see app/telemetry.py. Installed and enabled by
+# deploy/deploy.sh's install_units; its credentials come from
+# /etc/pi-config-ui/telemetry.env (see deploy/telemetry.env.example).
+#
+# Install:
+#   sudo cp deploy/pi-telemetryd.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pi-telemetryd
+
+[Unit]
+Description=Pi Config UI - MQTT telemetry agent
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi-config-ui
+Group=pi-config-ui
+WorkingDirectory=/opt/pi-config-ui
+EnvironmentFile=/etc/pi-config-ui/telemetry.env
+ExecStart=/opt/pi-config-ui/venv/bin/python -m app.telemetry
+Restart=always
+# Deliberately long for a 1GHz single core: the agent already retries the
+# broker internally, so a restart here only ever means a real crash.
+RestartSec=30
+
+# Strictest sandbox in this project, and it can afford to be: everything
+# this agent reads (/proc, /sys, psutil, the monitor state file) is
+# world-readable, and it only ever opens one outbound TCP connection. No
+# capabilities, no writable paths — contrast pi-config-ui.service, which
+# needs CAP_NET_ADMIN for pyroute2.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

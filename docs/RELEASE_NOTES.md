@@ -6,6 +6,48 @@ Contact: mukesh.kesharwani@adobe.com
 
 # Release notes
 
+## 1.0.4 — 2026-09-29
+
+Adds **MQTT telemetry to Home Assistant**: both Pis now publish their own
+health to the Mosquitto broker and appear in HA as devices, with no
+YAML-side configuration.
+
+### New
+
+- **`pi-telemetryd`** (`app/telemetry.py`, `deploy/pi-telemetryd.service`):
+  a standalone agent publishing CPU temperature, CPU/memory/disk
+  utilisation, uptime, last boot, last downtime, and per-interface
+  TX/RX bytes and rates every 60s, using Home Assistant MQTT Discovery.
+  Device availability comes from an MQTT Last Will, so HA marks a Pi
+  `unavailable` the moment it drops rather than showing a stale reading.
+- **`app/metrics.py`**: the collectors behind both the web dashboard and
+  the telemetry agent, so the two can't disagree. It imports nothing from
+  `app.config`/`app.auth` — the agent must run on a device that has never
+  been given SSO credentials.
+- **CPU temperature** is now on `GET /api/monitor/stats` too. The thermal
+  zone is matched by `type`, never by index: `thermal_zone0` is the CPU on
+  the Raspberry Pi Zero W but the *GPU* on the Walnut Pi, where the CPU is
+  `thermal_zone2`.
+- **`deploy/telemetry.env.example`** and a `configure_telemetry` step in
+  `deploy.sh`, following the same contract as `configure_sso`: install a
+  placeholder and tell the operator to fill it in over SSH — the script
+  never sees or fabricates a secret. Unlike SSO, a missing config is not
+  fatal; the unit is simply left disabled and the deploy carries on.
+- `paho-mqtt==2.1.0` in `requirements.txt` (pure Python, so no armv6l/
+  arm64 wheel problem on either board).
+
+### Notes
+
+- The agent is the most tightly sandboxed unit in this project: no
+  capabilities, no writable paths, `ProtectSystem=strict`. Everything it
+  reads is world-readable and it only opens one outbound TCP connection.
+  It touches no network configuration, which is what makes it safe to
+  deploy to a device reachable only over WireGuard.
+- Byte counters are published as `total_increasing`, so HA handles the
+  counter resetting to zero on reboot instead of recording a huge dip.
+- Downtime is still computed solely by `app/monitor.py`'s heartbeat; the
+  agent only ever *reads* `state.json`, so the two processes can't race.
+
 ## 1.0.3 — 2026-09-29
 
 ### Fixed

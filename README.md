@@ -102,6 +102,16 @@ at a real cert (a self-signed one is fine for LAN-only use) under
 `/etc/pi-config-ui/tls/`. For a real publicly-trusted cert via Let's
 Encrypt, see `docs/RUNBOOK.md` §5b.
 
+MQTT telemetry (optional): copy `deploy/telemetry.env.example` to
+`/etc/pi-config-ui/telemetry.env`, fill in the broker host and this
+device's own credentials, and `chmod 600` it. `pi-telemetryd` then
+publishes CPU temperature, CPU/memory/disk utilisation, uptime, last
+boot, last downtime and per-interface TX/RX to Home Assistant via MQTT
+Discovery. Leave the file unconfigured and the unit simply stays
+disabled. `TELEMETRY_MQTT_HOST` must be an address the device can already
+reach — never widen a WireGuard tunnel's `AllowedIPs` to make telemetry
+work. See `docs/RUNBOOK.md` §5g.
+
 ## Run
 
 ```

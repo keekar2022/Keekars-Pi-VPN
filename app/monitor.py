@@ -4,7 +4,6 @@
 import asyncio
 import json
 import logging
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,6 +11,7 @@ import psutil
 from fastapi import APIRouter, Depends
 
 from app.auth import current_user
+from app.metrics import NetRates, cpu_temp_c, load_state, ntp_synced, save_state, uptime_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +21,7 @@ router = APIRouter(prefix="/api/monitor", tags=["monitor"], dependencies=[Depend
 # baseline to diff against.
 psutil.cpu_percent(interval=None)
 
-_last_counters = psutil.net_io_counters(pernic=True)
-_last_time = time.monotonic()
+_net_rates = NetRates()
 
 # --- Downtime tracking -----------------------------------------------------
 #
@@ -34,8 +33,6 @@ _last_time = time.monotonic()
 # only reads/persists/compares boot_time() after confirming NTP sync, or a
 # same-boot service restart could be misdetected as a device reboot.
 
-_NTP_SYNC_MARKER = Path("/run/systemd/timesync/synchronized")
-_STATE_PATH = Path("/etc/pi-config-ui/monitor/state.json")
 _HEARTBEAT_INTERVAL_S = 60
 
 # Written by deploy/maintenance.sh's cmd_boot_check (running as root, via
@@ -48,35 +45,14 @@ _last_downtime_seconds: float | None = None
 _boot_comparison_done = False
 
 
-def _ntp_synced() -> bool:
-    return _NTP_SYNC_MARKER.exists()
-
-
-def _load_state() -> dict:
-    if not _STATE_PATH.exists():
-        return {}
-    try:
-        return json.loads(_STATE_PATH.read_text())
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.error("monitor_state_read_failed", extra={"event": "monitor.state.read_failed", "error": str(exc)})
-        return {}
-
-
-def _save_state(data: dict) -> None:
-    _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data))
-    tmp.replace(_STATE_PATH)
-
-
 async def _heartbeat_tick() -> None:
     global _last_downtime_seconds, _boot_comparison_done
 
-    if not _ntp_synced():
+    if not ntp_synced():
         # Clock isn't trustworthy yet — touch nothing, retry next tick.
         return
 
-    state = _load_state()
+    state = load_state()
     now = datetime.now(timezone.utc)
     current_boot_time = psutil.boot_time()
 
@@ -111,7 +87,7 @@ async def _heartbeat_tick() -> None:
         _boot_comparison_done = True
 
     state["last_seen"] = now.isoformat()
-    _save_state(state)
+    save_state(state)
 
 
 def _load_rollback_alert() -> dict | None:
@@ -174,53 +150,29 @@ def _top_processes():
     return top_cpu, top_mem
 
 
-def _uptime_seconds() -> float | None:
-    # /proc/uptime's first field is kernel-monotonic seconds since boot —
-    # deliberately not psutil.boot_time(), which is wall-clock-derived and
-    # was already found unreliable pre-NTP-sync on this hardware (see the
-    # downtime-tracking heartbeat above and docs/PROJECT_NOTES.md). Uptime
-    # doesn't need any of that NTP-gating machinery since this value is
-    # immune to that class of bug entirely.
-    try:
-        with open("/proc/uptime") as f:
-            return float(f.read().split()[0])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
 @router.get("/stats")
 async def stats():
-    global _last_counters, _last_time
-
-    now = time.monotonic()
-    elapsed = max(now - _last_time, 1e-6)
-    counters = psutil.net_io_counters(pernic=True)
-
-    interfaces = {}
-    for name, c in counters.items():
-        prev = _last_counters.get(name)
-        sent_rate = (c.bytes_sent - prev.bytes_sent) / elapsed if prev else 0
-        recv_rate = (c.bytes_recv - prev.bytes_recv) / elapsed if prev else 0
-        interfaces[name] = {
-            "bytes_sent_per_sec": max(sent_rate, 0),
-            "bytes_recv_per_sec": max(recv_rate, 0),
+    interfaces = {
+        name: {
+            "bytes_sent_per_sec": v["bytes_sent_per_sec"],
+            "bytes_recv_per_sec": v["bytes_recv_per_sec"],
         }
-
-    _last_counters = counters
-    _last_time = now
+        for name, v in _net_rates.sample().items()
+    }
 
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
     top_cpu, top_mem = _top_processes()
     return {
         "cpu_percent": psutil.cpu_percent(interval=None),
+        "cpu_temp_c": cpu_temp_c(),
         "mem_percent": mem.percent,
         "disk_percent": disk.percent,
         "interfaces": interfaces,
         "top_cpu": top_cpu,
         "top_mem": top_mem,
         "last_downtime_seconds": _last_downtime_seconds,
-        "uptime_seconds": _uptime_seconds(),
+        "uptime_seconds": uptime_seconds(),
         "rollback_alert": _load_rollback_alert(),
     }
 

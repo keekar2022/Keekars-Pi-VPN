@@ -53,9 +53,9 @@
 # user must exist before its venv can be created):
 #   preflight -> bootstrap_system -> provision_tls_cert -> deploy_code ->
 #   install_dependencies -> migrate_to_networkmanager -> configure_wifi ->
-#   configure_sso -> install_units -> install_wifi_recovery ->
-#   set_permissions -> setup_cron -> register_dns -> restart_services ->
-#   verify_deployment
+#   configure_sso -> configure_telemetry -> install_units ->
+#   install_wifi_recovery -> set_permissions -> setup_cron -> register_dns ->
+#   restart_services -> verify_deployment
 #
 # --only runs a single function in isolation and assumes prior functions'
 # state already exists (e.g. --only setup_cron needs deploy_code to have
@@ -324,7 +324,8 @@ mkdir -p /opt/pi-config-ui/deploy
 # actually referenced by any systemd unit/cron entry — exactly the kind
 # of orphaned-file failure risk this project is trying to keep down.
 rsync -a --delete "$STAGE_DIR/deploy/" /opt/pi-config-ui/deploy/
-chown -R pi-config-ui:pi-config-ui /opt/pi-config-ui/app /opt/pi-config-ui/requirements.txt /opt/pi-config-ui/deploy
+chown -R pi-config-ui:pi-config-ui /opt/pi-config-ui/app /opt/pi-config-ui/requirements.txt
+chown -R root:root /opt/pi-config-ui/deploy
 rm -rf "$STAGE_DIR"
 REMOTE
 }
@@ -599,6 +600,38 @@ REMOTE
   fi
 }
 
+# MQTT telemetry credentials (app/telemetry.py). Same contract as
+# configure_sso: install a placeholder template if nothing is there yet and
+# tell the operator to fill it in over SSH — this script never sees or
+# fabricates a secret. Unlike SSO, a missing config is NOT fatal: telemetry
+# is optional, so the unit is simply left disabled and the deploy carries on.
+configure_telemetry() {
+  log "Configuring MQTT telemetry"
+  if remote <<'REMOTE'
+test -f /etc/pi-config-ui/telemetry.env
+REMOTE
+  then
+    remote <<'REMOTE'
+set -euo pipefail
+if grep -q '^TELEMETRY_MQTT_PASSWORD=CHANGEME' /etc/pi-config-ui/telemetry.env; then
+  echo "telemetry.env still holds the placeholder password — pi-telemetryd will stay disabled."
+else
+  echo "telemetry.env present."
+fi
+REMOTE
+  else
+    warn "No /etc/pi-config-ui/telemetry.env found — installing the placeholder template."
+    scp -q -o "HostKeyAlias=$HOST_KEY_ALIAS" "$REPO_ROOT/deploy/telemetry.env.example" "$PI_HOST:/tmp/telemetry.env.staged-$$"
+    remote <<REMOTE
+set -euo pipefail
+mv "/tmp/telemetry.env.staged-$$" /etc/pi-config-ui/telemetry.env
+chown pi-config-ui:pi-config-ui /etc/pi-config-ui/telemetry.env
+chmod 600 /etc/pi-config-ui/telemetry.env
+REMOTE
+    warn "Fill in real values in /etc/pi-config-ui/telemetry.env on the Pi, then re-run this script to enable pi-telemetryd."
+  fi
+}
+
 install_units() {
   log "Installing systemd units and polkit rule"
   remote <<'REMOTE'
@@ -606,6 +639,7 @@ set -euo pipefail
 cp /opt/pi-config-ui/deploy/pi-config-ui.service /etc/systemd/system/pi-config-ui.service
 cp /opt/pi-config-ui/deploy/pi-wg-helperd.service /etc/systemd/system/pi-wg-helperd.service
 cp /opt/pi-config-ui/deploy/pi-config-ui-boot-check.service /etc/systemd/system/pi-config-ui-boot-check.service
+cp /opt/pi-config-ui/deploy/pi-telemetryd.service /etc/systemd/system/pi-telemetryd.service
 mkdir -p /opt/pi-wg-helperd
 cp /opt/pi-config-ui/deploy/pi-wg-helperd/helper.py /opt/pi-wg-helperd/helper.py
 chown root:root /opt/pi-wg-helperd/helper.py
@@ -614,6 +648,13 @@ cp /opt/pi-config-ui/deploy/polkit-rules/50-pi-config-ui-networkmanager.rules /e
 cp /opt/pi-config-ui/deploy/polkit-rules/51-pi-config-ui-power.rules /etc/polkit-1/rules.d/
 systemctl daemon-reload
 systemctl enable pi-config-ui pi-wg-helperd pi-config-ui-boot-check
+# Only enabled once real credentials exist: with a CHANGEME placeholder the
+# agent would just log auth failures against the broker on every restart.
+if grep -q '^TELEMETRY_MQTT_PASSWORD=CHANGEME' /etc/pi-config-ui/telemetry.env 2>/dev/null; then
+  systemctl disable pi-telemetryd 2>/dev/null || true
+else
+  systemctl enable pi-telemetryd
+fi
 REMOTE
 }
 
@@ -640,7 +681,20 @@ set_permissions() {
   log "Setting file/directory permissions"
   remote <<'REMOTE'
 set -euo pipefail
-chown -R pi-config-ui:pi-config-ui /opt/pi-config-ui
+# Only what the app itself owns. A recursive chown of /opt/pi-config-ui also
+# handed site-local files (e.g. scripts holding credentials) and root-run
+# maintenance.sh to the unprivileged web-app user.
+chown pi-config-ui:pi-config-ui /opt/pi-config-ui
+for p in app requirements.txt venv; do
+  if [ -e "/opt/pi-config-ui/$p" ]; then
+    chown -R pi-config-ui:pi-config-ui "/opt/pi-config-ui/$p"
+  fi
+done
+# Root runs these (cron, systemd, installs), so the app must not be able to edit them.
+chown -R root:root /opt/pi-config-ui/deploy
+if [ -f /opt/pi-config-ui/maintenance.sh ]; then
+  chown root:root /opt/pi-config-ui/maintenance.sh
+fi
 chown -R pi-config-ui:pi-config-ui /etc/pi-config-ui/tls /etc/pi-config-ui/wireguard /etc/pi-config-ui/monitor
 # Package rollback artifacts are consumed by a root-run systemd service and
 # must not be replaceable by the unprivileged web application.
@@ -649,6 +703,10 @@ chmod 755 /etc/pi-config-ui/monitor/pkg-backups
 if [ -f /etc/pi-config-ui/sso.env ]; then
   chown pi-config-ui:pi-config-ui /etc/pi-config-ui/sso.env
   chmod 600 /etc/pi-config-ui/sso.env
+fi
+if [ -f /etc/pi-config-ui/telemetry.env ]; then
+  chown pi-config-ui:pi-config-ui /etc/pi-config-ui/telemetry.env
+  chmod 600 /etc/pi-config-ui/telemetry.env
 fi
 if [ -f /etc/pi-config-ui/tls/key.pem ]; then
   chmod 600 /etc/pi-config-ui/tls/key.pem
@@ -724,6 +782,10 @@ restart_services() {
 set -euo pipefail
 systemctl restart pi-wg-helperd
 sleep 1
+# Only if enabled (i.e. real credentials were provisioned). try-restart is a
+# no-op on a device that never configured telemetry, and this agent opens
+# nothing but an outbound MQTT socket, so restarting it can't affect SSH.
+systemctl try-restart pi-telemetryd 2>/dev/null || true
 systemctl restart pi-config-ui
 
 # uvicorn's own import/startup on this CPU has consistently taken ~20s in
@@ -758,6 +820,9 @@ verify_deployment() {
 set -euo pipefail
 echo "-- service states --"
 systemctl is-active pi-config-ui pi-wg-helperd || true
+echo "-- telemetry agent (inactive is fine if telemetry.env was never filled in) --"
+systemctl is-enabled pi-telemetryd 2>/dev/null || echo "not enabled"
+systemctl is-active pi-telemetryd 2>/dev/null || echo "not active"
 PORT=$(ss -tlnp 2>/dev/null | grep uvicorn | grep -oE ':[0-9]+' | head -1 | tr -d ':') || true
 PORT="${PORT:-443}"
 echo "-- root endpoint (expect 303) --"
@@ -814,6 +879,7 @@ main() {
     migrate_to_networkmanager
     configure_wifi
     configure_sso
+    configure_telemetry
     install_units
     install_wifi_recovery
     set_permissions

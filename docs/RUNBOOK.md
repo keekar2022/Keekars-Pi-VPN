@@ -640,6 +640,101 @@ came back up (~2.5 minutes, consistent with §0/§14), and `pi-config-ui`
 was healthy again afterward with no rollback alert (expected — this
 wasn't an update-triggered reboot, §5d doesn't apply here).
 
+## 5g. MQTT telemetry to Home Assistant
+
+`pi-telemetryd` (`app/telemetry.py`) publishes this device's health to an
+MQTT broker every 60s using Home Assistant's MQTT Discovery, so the device
+appears in HA with no YAML-side configuration. It is a separate unit from
+the web app deliberately: telemetry must keep reporting across app
+restarts, and it needs none of the app's privileges.
+
+**Metrics**: CPU temperature, CPU/memory/disk utilisation, disk free,
+uptime, last boot (a `timestamp` entity, so HA renders "3 days ago"), last
+downtime, and per-interface TX/RX bytes plus rates.
+
+**Reachability is the thing to get right, and to get right *first*.**
+`TELEMETRY_MQTT_HOST` must be an address this device can already reach:
+
+- a device on the broker's LAN uses the broker's LAN address;
+- a device reachable only over WireGuard uses a broker address inside a
+  subnet that tunnel's `AllowedIPs` *already* covers.
+
+Do not widen `AllowedIPs` to make telemetry work. §9 and
+[`PROJECT_NOTES.md`](PROJECT_NOTES.md) Part 3 record a full SSH lockout
+caused by exactly that. Telemetry is optional; SSH is not. Check first,
+from the device itself:
+
+```
+nc -vz <broker-ip> 1883    # or: bash -c 'cat </dev/null >/dev/tcp/<ip>/1883'
+```
+
+**Credentials** live in `/etc/pi-config-ui/telemetry.env` (mode 0600,
+owned `pi-config-ui`) — see `deploy/telemetry.env.example`. Use one broker
+account per device so one can be revoked without affecting the other. With
+the Home Assistant *Mosquitto broker* add-on these are its `logins`
+option, which the Supervisor API can set:
+
+```
+curl -X POST -H "Authorization: Bearer $SUPERVISOR_TOKEN" \
+  -H "Content-Type: application/json" --data-binary @- \
+  http://supervisor/addons/core_mosquitto/options
+```
+
+Restart the add-on afterwards so it regenerates its password file. Note
+the add-on's `network:` mapping publishes 1883 on *all* host interfaces,
+so a dual-homed HA box answers on both without extra configuration.
+
+**Gotcha — a password with no trailing newline.** `pass insert -m` stores
+exactly what it was given. Building `telemetry.env` by concatenating
+`pass show` output with more lines silently runs the next key onto the
+password line. Always interpolate it (`printf '...=%s\n' "$PW"`), and
+verify on-device by printing the password's *length*, never its value.
+
+**Deploy**: `deploy.sh`'s `configure_telemetry` installs the placeholder
+template if the file is absent and tells you to fill it in over SSH — the
+script never sees or fabricates a secret. `install_units` only enables the
+unit once the placeholder password is gone, so a device that never
+configured telemetry doesn't sit logging auth failures at the broker.
+
+**Sandboxing**: this is the most restricted unit in the project — no
+capabilities, no `ReadWritePaths`, `ProtectSystem=strict`. Everything it
+reads (`/proc`, `/sys`, `state.json`) is world-readable and it opens
+exactly one outbound TCP connection. Contrast §7's `pi-config-ui.service`,
+which needs `CAP_NET_ADMIN` for pyroute2.
+
+**Design notes worth not relearning**:
+
+- The CPU thermal zone is matched by `type`, never by index.
+  `thermal_zone0` is the CPU on the Raspberry Pi Zero W but the **GPU** on
+  the Walnut Pi, where the CPU is `thermal_zone2` — indexing by zone
+  number silently reports the wrong die.
+- Byte counters are `total_increasing`, so HA handles them resetting to
+  zero at reboot instead of recording a huge negative dip.
+- The first state message is published from the MQTT `on_connect`
+  callback, not from the first loop iteration. `connect_async` hasn't
+  completed when the loop first runs, and a QoS 0 publish while
+  disconnected is dropped silently — which left HA with no state at all
+  for a full interval.
+- While disconnected the agent skips publishing rather than queueing:
+  queueing retained state for a broker that's been gone for hours only
+  delivers a burst of stale readings, and an unbounded queue is a real
+  memory concern on a Pi Zero.
+- "Is this device down right now" is answered by the MQTT Last Will on the
+  availability topic, not by any logic in the agent. §5e's downtime
+  tracking stays the sole writer of `state.json`; the agent only reads it,
+  so the two processes can't race.
+
+**Verify** (from the broker host):
+
+```
+mosquitto_sub -h 127.0.0.1 -u <device> -P <pw> -t 'pi-telemetry/#' -v
+```
+
+Expect a retained `.../availability online` and a `.../state` JSON blob.
+Killing the agent (`systemctl kill -s KILL pi-telemetryd`) must flip the
+HA entities to `unavailable` within ~20s, and `Restart=always`/
+`RestartSec=30` must bring it back without intervention.
+
 ## 6. Groups before services — order matters
 
 `pi-config-ui.service` references `SupplementaryGroups=pi-wg-helper`. If
