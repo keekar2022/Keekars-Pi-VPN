@@ -106,6 +106,15 @@ class MaintenancePolicyTests(unittest.TestCase):
         self.assertIn("grep -iv '^f[cd]'", source)
         self.assertIn("-X DELETE", source)
 
+    def test_deploy_never_hands_whole_install_dir_to_app_user(self):
+        source = DEPLOY_SCRIPT.read_text()
+
+        # A recursive chown here gave site-local secrets and root-run code to the web-app user.
+        self.assertNotRegex(source, r"chown -R pi-config-ui:pi-config-ui /opt/pi-config-ui(\s|$)")
+        self.assertNotRegex(source, r"chown -R pi-config-ui:pi-config-ui [^\n]*/opt/pi-config-ui/deploy")
+        self.assertIn("chown -R root:root /opt/pi-config-ui/deploy", source)
+        self.assertIn("for p in app requirements.txt venv; do", source)
+
     def test_split_dns_is_opt_in_validated_and_removable(self):
         source = DEPLOY_SCRIPT.read_text()
 
